@@ -1,139 +1,159 @@
 document.addEventListener('DOMContentLoaded', () => {
-    const startAutoTestButton = document.getElementById('startAutoTestButton');
+    // --- DOM Elements for Automation ---
+    const configureTestsButton = document.getElementById('configureTestsButton');
+    const testConfigModal = document.getElementById('testConfigModal');
+    const runSelectedTestsButton = document.getElementById('runSelectedTestsButton');
+    const cancelTestButton = document.getElementById('cancelTestButton');
     const statusEl = document.getElementById('status');
     const chartsArea = document.getElementById('chartsArea');
 
-    const testScenarios = {
-        streams: [1, 4, 8, 32],
-        threads: [1, 2, 4, 8],
-        resolutions: ["640x360", "854x480", "1280x720"]
-    };
+    // --- Checkbox Containers ---
+    const implCheckboxes = document.getElementById('implCheckboxes');
+    const resCheckboxes = document.getElementById('resCheckboxes');
+    const streamCheckboxes = document.getElementById('streamCheckboxes');
+    const threadCheckboxes = document.getElementById('threadCheckboxes');
 
-    function createChartGroup(threadCount) {
+    // --- Chart Management ---
+    let charts = {};
+
+    function createChartGroup(title, resolutions) {
+        const groupId = title.replace(/[^a-zA-Z0-9]/g, '');
         const groupContainer = document.createElement('div');
         groupContainer.innerHTML = `
-            <h2 class="text-2xl font-bold mb-4 text-center text-white">Results for ${threadCount} Thread(s)</h2>
+            <h2 class="text-2xl font-bold mb-4 text-center text-white">${title}</h2>
             <div class="grid grid-cols-1 lg:grid-cols-2 gap-8">
                 <div class="chart-container">
-                    <canvas id="fpsChart-${threadCount}"></canvas>
+                    <canvas id="fpsChart-${groupId}"></canvas>
                 </div>
                 <div class="chart-container">
-                    <canvas id="decodeTimeChart-${threadCount}"></canvas>
+                    <canvas id="decodeTimeChart-${groupId}"></canvas>
                 </div>
             </div>
         `;
         chartsArea.appendChild(groupContainer);
 
-        const fpsCtx = document.getElementById(`fpsChart-${threadCount}`).getContext('2d');
+        const commonOptions = {
+            responsive: true,
+            plugins: { legend: { labels: { color: 'white' } } },
+            scales: {
+                x: { title: { display: true, text: 'Resolution', color: 'white' }, ticks: { color: 'white' }, grid: { color: 'rgba(255,255,255,0.1)' } },
+                y: { ticks: { color: 'white' }, grid: { color: 'rgba(255,255,255,0.1)' } }
+            }
+        };
+
+        const fpsCtx = document.getElementById(`fpsChart-${groupId}`).getContext('2d');
         const fpsChart = new Chart(fpsCtx, {
             type: 'line',
-            data: { labels: testScenarios.resolutions, datasets: [] },
-            options: {
-                responsive: true,
-                plugins: {
-                    title: { display: true, text: 'Avg. Output FPS vs. Resolution', color: 'white' },
-                    legend: { labels: { color: 'white' } }
-                },
-                scales: {
-                    x: { ticks: { color: 'white' }, grid: { color: 'rgba(255,255,255,0.1)' } },
-                    y: { ticks: { color: 'white' }, grid: { color: 'rgba(255,255,255,0.1)' }, title: { display: true, text: 'Avg. Output FPS', color: 'white' } }
-                }
-            }
+            data: { labels: resolutions, datasets: [] },
+            options: { ...commonOptions, plugins: { ...commonOptions.plugins, title: { display: true, text: 'Avg. Output FPS vs. Resolution', color: 'white' } }, scales: { ...commonOptions.scales, y: { ...commonOptions.scales.y, title: { display: true, text: 'Avg. Output FPS', color: 'white' } } } }
         });
 
-        const decodeTimeCtx = document.getElementById(`decodeTimeChart-${threadCount}`).getContext('2d');
+        const decodeTimeCtx = document.getElementById(`decodeTimeChart-${groupId}`).getContext('2d');
         const decodeTimeChart = new Chart(decodeTimeCtx, {
             type: 'line',
-            data: { labels: testScenarios.resolutions, datasets: [] },
-            options: {
-                responsive: true,
-                plugins: {
-                    title: { display: true, text: 'Avg. Decode Time vs. Resolution', color: 'white' },
-                    legend: { labels: { color: 'white' } }
-                },
-                scales: {
-                    x: { ticks: { color: 'white' }, grid: { color: 'rgba(255,255,255,0.1)' } },
-                    y: { ticks: { color: 'white' }, grid: { color: 'rgba(255,255,255,0.1)' }, title: { display: true, text: 'Avg. Decode Time (ms)', color: 'white' } }
-                }
-            }
+            data: { labels: resolutions, datasets: [] },
+            options: { ...commonOptions, plugins: { ...commonOptions.plugins, title: { display: true, text: 'Avg. Decode Time vs. Resolution', color: 'white' } }, scales: { ...commonOptions.scales, y: { ...commonOptions.scales.y, title: { display: true, text: 'Avg. Decode Time (ms)', color: 'white' } } } }
         });
 
         return { fpsChart, decodeTimeChart };
     }
 
-    function addDataToCharts(charts, label, fpsData, decodeTimeData) {
-        const color = `hsl(${charts.fpsChart.data.datasets.length * 60}, 70%, 60%)`;
-        charts.fpsChart.data.datasets.push({
-            label: label,
-            data: fpsData,
-            borderColor: color,
-            backgroundColor: color,
-            fill: false,
-            tension: 0.1
+    function addDataToCharts(chartInstance, label, data, color) {
+        chartInstance.data.datasets.push({
+            label: label, data: data, borderColor: color, backgroundColor: color,
+            fill: false, tension: 0.1
         });
-        charts.decodeTimeChart.data.datasets.push({
-            label: label,
-            data: decodeTimeData,
-            borderColor: color,
-            backgroundColor: color,
-            fill: false,
-            tension: 0.1
-        });
-        charts.fpsChart.update();
-        charts.decodeTimeChart.update();
+        chartInstance.update();
     }
 
+    // --- Test Execution ---
     async function runTest(config) {
-        const { threads, streams, resolution } = config;
-        statusEl.textContent = `Testing: ${resolution}, ${streams} streams, ${threads} threads...`;
+        const { implementation, threads, streams, resolution } = config;
+        statusEl.textContent = `Testing: ${implementation}, ${resolution}, ${streams} streams, ${threads || 'N/A'} threads...`;
         
+        window.app.setImplementation(implementation);
         window.app.setResolution(resolution);
         window.app.setStreams(streams);
-        window.app.setThreads(threads);
+        if (implementation === 'wasm') {
+            window.app.setThreads(threads);
+        }
 
         await window.app.start();
-
-        // Wait for stats to stabilize
         await new Promise(resolve => setTimeout(resolve, 5000)); 
-
         const stats = window.app.getStats();
         console.log(`Result for ${JSON.stringify(config)}:`, stats);
-        
-        // No need to stop between tests of the same thread count
+        await window.app.stop();
+        await new Promise(resolve => setTimeout(resolve, 1000)); 
         return stats;
     }
 
-    startAutoTestButton.addEventListener('click', async () => {
+    // --- Event Listeners ---
+    configureTestsButton.addEventListener('click', () => {
+        testConfigModal.classList.remove('hidden');
+    });
+
+    cancelTestButton.addEventListener('click', () => {
+        testConfigModal.classList.add('hidden');
+    });
+
+    runSelectedTestsButton.addEventListener('click', async () => {
         if (window.app.isProcessing()) {
             alert("Please stop the camera before starting automated tests.");
             return;
         }
-
-        chartsArea.innerHTML = ''; // Clear previous charts
+        testConfigModal.classList.add('hidden');
+        chartsArea.innerHTML = ''; 
         chartsArea.classList.remove('hidden');
-        startAutoTestButton.disabled = true;
-        startAutoTestButton.textContent = 'Testing...';
+        runSelectedTestsButton.disabled = true;
+        runSelectedTestsButton.textContent = 'Testing...';
 
-        for (const threadCount of testScenarios.threads) {
-            const charts = createChartGroup(threadCount);
-            
-            for (const streamCount of testScenarios.streams) {
+        // Build the test plan dynamically from checkboxes.
+        const getCheckedValues = (container) => 
+            [...container.querySelectorAll('input[type="checkbox"]:checked')].map(cb => cb.value);
+
+        const selectedImplementations = getCheckedValues(implCheckboxes);
+        const selectedResolutions = getCheckedValues(resCheckboxes);
+        const selectedStreams = getCheckedValues(streamCheckboxes).map(Number);
+        const selectedThreads = getCheckedValues(threadCheckboxes).map(Number);
+
+        // --- Run WebCodecs Tests ---
+        if (selectedImplementations.includes('webcodecs')) {
+            const charts = createChartGroup('Native - WebCodecs', selectedResolutions);
+            for (const streamCount of selectedStreams) {
                 let fpsResults = [];
                 let decodeTimeResults = [];
-                const label = `${streamCount} streams`;
-
-                for (const resolution of testScenarios.resolutions) {
-                    const stats = await runTest({ threads: threadCount, streams: streamCount, resolution });
+                for (const resolution of selectedResolutions) {
+                    const stats = await runTest({ implementation: 'webcodecs', streams: streamCount, resolution });
                     fpsResults.push(stats.avgOutputFps);
                     decodeTimeResults.push(stats.avgDecodeTime);
                 }
-                addDataToCharts(charts, label, fpsResults, decodeTimeResults);
+                const color = `hsl(${streamCount * 20}, 70%, 60%)`;
+                addDataToCharts(charts.fpsChart, `${streamCount} streams`, fpsResults, color);
+                addDataToCharts(charts.decodeTimeChart, `${streamCount} streams`, decodeTimeResults, color);
             }
         }
         
-        await window.app.stop();
+        // --- Run Wasm Tests ---
+        if (selectedImplementations.includes('wasm')) {
+            for (const threadCount of selectedThreads) {
+                const charts = createChartGroup(`Wasm - ${threadCount} Thread(s)`, selectedResolutions);
+                for (const streamCount of selectedStreams) {
+                    let fpsResults = [];
+                    let decodeTimeResults = [];
+                    for (const resolution of selectedResolutions) {
+                        const stats = await runTest({ implementation: 'wasm', threads: threadCount, streams: streamCount, resolution });
+                        fpsResults.push(stats.avgOutputFps);
+                        decodeTimeResults.push(stats.avgDecodeTime);
+                    }
+                    const color = `hsl(${streamCount * 20}, 70%, 60%)`;
+                    addDataToCharts(charts.fpsChart, `${streamCount} streams`, fpsResults, color);
+                    addDataToCharts(charts.decodeTimeChart, `${streamCount} streams`, decodeTimeResults, color);
+                }
+            }
+        }
+        
         statusEl.textContent = 'Testing complete!';
-        startAutoTestButton.disabled = false;
-        startAutoTestButton.textContent = 'Run Performance Tests';
+        runSelectedTestsButton.disabled = false;
+        runSelectedTestsButton.textContent = 'Start Selected Tests';
     });
 });
