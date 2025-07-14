@@ -1,7 +1,7 @@
 # Real-Time Video Codec Performance Analyzer
 
 <p align="center">
-  <img src="https://path-to-your-project-screenshot.png" alt="Screenshot of the performance analyzer UI" width="800"/>
+  <img src="Screenshot of the performance analyzer UI.png" alt="Screenshot of the performance analyzer UI" width="800"/>
 </p>
 
 For engineers building real-time communication (RTC) and media streaming applications, the choice of video codec implementation is a critical architectural decision. This project provides a powerful, in-browser laboratory likr setup for analyzing the performance trade-offs between two key approaches: a **software-based H.264 codec (OpenH264) compiled to WebAssembly**, and the browser's **native, hardware-accelerated WebCodecs API**.
