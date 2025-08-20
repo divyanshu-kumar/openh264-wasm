@@ -21,7 +21,8 @@ EMCC_FLAGS = \
 	-s EXPORTED_FUNCTIONS="['_malloc','_free']" \
 	-s EXPORTED_RUNTIME_METHODS="['cwrap','getValue']" \
 	-s ALLOW_MEMORY_GROWTH=1 \
-	-O3
+	-O3 \
+	-msimd128
 
 all: $(OUTPUT_JS)
 

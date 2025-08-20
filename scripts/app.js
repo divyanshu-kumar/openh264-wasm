@@ -40,6 +40,7 @@ function main() {
     let capturedResults = [];
     let workers = [];
     let lastWorkerIndex = 0;
+    let rgbaBufferPtr = 0;
     
     // WebCodecs State
     let videoEncoder, decoders = [];
@@ -94,9 +95,15 @@ function main() {
         }
         workers.forEach(w => w.terminate());
         workers = [];
-        if (videoEncoder && videoEncoder.state !== 'closed') videoEncoder.close();
+        if (videoEncoder && videoEncoder.state !== 'closed') {
+            videoEncoder.close();
+        }
         decoders.forEach(d => { if (d.state !== 'closed') d.close(); });
         decoders = [];
+        if (rgbaBufferPtr) {
+            Module._free(rgbaBufferPtr);
+            rgbaBufferPtr = 0;
+        }
         inputVideo.srcObject = null;
         outputContainer.innerHTML = '';
         statusEl.textContent = 'Status: Idle';
@@ -109,7 +116,7 @@ function main() {
         try {
             statusEl.textContent = 'Status: Starting...';
             const [w, h] = resolutionSelect.value.split('x').map(Number);
-            const constraints = { video: { width: { ideal: w }, height: { ideal: h } } };
+            const constraints = { video: { width: { ideal: w }, height: { ideal: h }, framerate: { ideal: 30 } } };
             
             mediaStream = await navigator.mediaDevices.getUserMedia(constraints);
             cameraActive = true;
@@ -153,7 +160,14 @@ function main() {
         tempCanvas.width = videoWidth;
         tempCanvas.height = videoHeight;
         tempCtx = tempCanvas.getContext('2d', { willReadFrequently: true });
-        if (initEncoderWasm(videoWidth, videoHeight, 1000000) !== 0) throw new Error('Wasm Encoder init failed.');
+        if (initEncoderWasm(videoWidth, videoHeight, 1000000) !== 0) {
+            throw new Error('Wasm Encoder init failed.');
+        }
+        const rgbaBufferSize = videoWidth * videoHeight * 4;
+        if (rgbaBufferPtr) {
+            Module._free(rgbaBufferPtr);
+        }
+        rgbaBufferPtr = Module._malloc(rgbaBufferSize);    
         await reconfigureWorkersAndCanvases();
     }
 
@@ -219,14 +233,12 @@ function main() {
         const imageData = tempCtx.getImageData(0, 0, videoWidth, videoHeight);
         const rgbaData = imageData.data;
         perfEls.captureTime.textContent = (performance.now() - t0).toFixed(2);
-        const rgbaBufferPtr = Module._malloc(rgbaData.length);
         HEAPU8.set(rgbaData, rgbaBufferPtr);
         const encodedDataPtr_ptr = Module._malloc(4);
         const encodedSize_ptr = Module._malloc(4);
         const t2 = performance.now();
         encodeFrameWasm(rgbaBufferPtr, videoWidth, videoHeight, encodedDataPtr_ptr, encodedSize_ptr);
         perfEls.encodeTime.textContent = (performance.now() - t2).toFixed(2);
-        Module._free(rgbaBufferPtr);
         const encodedDataPtr = Module.getValue(encodedDataPtr_ptr, 'i32');
         const encodedSize = Module.getValue(encodedSize_ptr, 'i32');
         Module._free(encodedDataPtr_ptr);
@@ -237,10 +249,16 @@ function main() {
             const numStreams = parseInt(streamCountSelect.value, 10);
             for (let i = 0; i < numStreams; i++) {
                 workers[i % workers.length].postMessage({
-                    type: 'decode', streamIndex: i, encodedData: encodedDataCopy.buffer.slice(0)
+                    type: 'decode', 
+                    streamIndex: i, 
+                    encodedData: encodedDataCopy.buffer,
+                    width: videoWidth,  
+                    height: videoHeight  
                 });
             }
-        } else if (encodedDataPtr) freeBufferWasm(encodedDataPtr);
+        } else if (encodedDataPtr) {
+            freeBufferWasm(encodedDataPtr);
+        }
         requestAnimationFrame(processLoopWasm);
     }
 

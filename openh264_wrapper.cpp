@@ -11,6 +11,8 @@ ISVCEncoder* encoder = nullptr;
 ISVCDecoder* decoder_pool[MAX_DECODERS];
 int decoder_pool_size = 0;
 
+unsigned char* yuv_buffer = nullptr;
+int yuv_buffer_size = 0;
 
 extern "C" {
 
@@ -144,8 +146,15 @@ void encode_frame(unsigned char* rgba_data, int width, int height, unsigned char
     pic.iColorFormat = videoFormatI420;
     int y_size = width * height;
     int uv_size = y_size / 4;
-    unsigned char* yuv_data = (unsigned char*)malloc(y_size + 2 * uv_size);
-    pic.pData[0] = yuv_data;
+    int required_size = y_size + 2 * uv_size;
+    if (required_size > yuv_buffer_size) {
+        if (yuv_buffer) {
+            free(yuv_buffer);
+        }
+        yuv_buffer = (unsigned char*)malloc(required_size);
+        yuv_buffer_size = required_size;
+    }
+    pic.pData[0] = yuv_buffer;
     pic.pData[1] = pic.pData[0] + y_size;
     pic.pData[2] = pic.pData[1] + uv_size;
     pic.iStride[0] = width;
@@ -153,10 +162,8 @@ void encode_frame(unsigned char* rgba_data, int width, int height, unsigned char
     pic.iStride[2] = width / 2;
     rgba_to_yuv(rgba_data, width, height, pic.pData[0], pic.pData[1], pic.pData[2]);
     if (encoder->EncodeFrame(&pic, &info) != cmResultSuccess) {
-        free(yuv_data);
         return;
     }
-    free(yuv_data);
     int total_size = 0;
     for (int i = 0; i < info.iLayerNum; ++i) {
         for (int j = 0; j < info.sLayerInfo[i].iNalCount; ++j) {
@@ -182,8 +189,7 @@ void encode_frame(unsigned char* rgba_data, int width, int height, unsigned char
 }
 
 EMSCRIPTEN_KEEPALIVE
-void decode_frame(int decoder_index, unsigned char* encoded_data, int size, unsigned char** out_rgba_data, int* out_width, int* out_height) {
-    *out_rgba_data = nullptr;
+void decode_frame(int decoder_index, unsigned char* encoded_data, int size, unsigned char* out_rgba_buffer, int* out_width, int* out_height) {
     *out_width = 0;
     *out_height = 0;
     if (decoder_index < 0 || decoder_index >= decoder_pool_size) {
@@ -200,10 +206,7 @@ void decode_frame(int decoder_index, unsigned char* encoded_data, int size, unsi
     int decoded_height = decoded_pict_info.UsrData.sSystemBuffer.iHeight;
     int y_stride = decoded_pict_info.UsrData.sSystemBuffer.iStride[0];
     int uv_stride = decoded_pict_info.UsrData.sSystemBuffer.iStride[1];
-    int rgba_size = decoded_width * decoded_height * 4;
-    unsigned char* rgba_buffer = (unsigned char*)malloc(rgba_size);
-    yuv_to_rgba(decoded_image_yuv[0], decoded_image_yuv[1], decoded_image_yuv[2], decoded_width, decoded_height, y_stride, uv_stride, rgba_buffer);
-    *out_rgba_data = rgba_buffer;
+    yuv_to_rgba(decoded_image_yuv[0], decoded_image_yuv[1], decoded_image_yuv[2], decoded_width, decoded_height, y_stride, uv_stride, out_rgba_buffer);
     *out_width = decoded_width;
     *out_height = decoded_height;
 }
