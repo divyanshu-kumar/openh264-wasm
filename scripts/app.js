@@ -39,9 +39,9 @@ function main() {
     let mediaStream = null;
     let capturedResults = [];
     let workers = [];
-    let lastWorkerIndex = 0;
-    let rgbaBufferPtr = 0;
+    let encoderWorker = null;
     
+
     // WebCodecs State
     let videoEncoder, decoders = [];
 
@@ -93,6 +93,10 @@ function main() {
             mediaStream.getTracks().forEach(track => track.stop());
             mediaStream = null;
         }
+        if (encoderWorker) {
+            encoderWorker.terminate();
+            encoderWorker = null;
+        }
         workers.forEach(w => w.terminate());
         workers = [];
         if (videoEncoder && videoEncoder.state !== 'closed') {
@@ -100,10 +104,6 @@ function main() {
         }
         decoders.forEach(d => { if (d.state !== 'closed') d.close(); });
         decoders = [];
-        if (rgbaBufferPtr) {
-            Module._free(rgbaBufferPtr);
-            rgbaBufferPtr = 0;
-        }
         inputVideo.srcObject = null;
         outputContainer.innerHTML = '';
         statusEl.textContent = 'Status: Idle';
@@ -163,15 +163,44 @@ function main() {
         tempCanvas.width = videoWidth;
         tempCanvas.height = videoHeight;
         tempCtx = tempCanvas.getContext('2d', { willReadFrequently: true });
-        if (initEncoderWasm(videoWidth, videoHeight, 1000000) !== 0) {
-            throw new Error('Wasm Encoder init failed.');
+
+        if (encoderWorker) {
+            encoderWorker.terminate();
         }
-        const rgbaBufferSize = videoWidth * videoHeight * 4;
-        if (rgbaBufferPtr) {
-            Module._free(rgbaBufferPtr);
-        }
-        rgbaBufferPtr = Module._malloc(rgbaBufferSize);    
-        await reconfigureWorkersAndCanvases();
+
+        return new Promise((resolve, reject) => {
+            encoderWorker = new Worker('scripts/encoder_worker.js');
+            encoderWorker.onerror = (err) => reject(err);
+            encoderWorker.onmessage = async (e) => {
+                const { type, encodedData, captureTime, encodeTime } = e.data;
+                if (type === 'ready') {
+                    // Once the worker's Wasm module is ready, initialize the encoder
+                    encoderWorker.postMessage({ type: 'init', width: videoWidth, height: videoHeight });
+                } else if (type === 'init_done') {
+                    // Once the encoder is initialized, set up the decoder workers
+                    await reconfigureWorkersAndCanvases();
+                    resolve();
+                } else if (type === 'encoded') {
+                    if (captureTime) {
+                        perfEls.captureTime.textContent = captureTime.toFixed(2);
+                    }
+                    if (encodeTime) {
+                        perfEls.encodeTime.textContent = encodeTime.toFixed(2);
+                    }
+                    // When an encoded frame comes back, distribute it to the decoders
+                    const numStreams = parseInt(streamCountSelect.value, 10);
+                    for (let i = 0; i < numStreams; i++) {
+                        workers[i % workers.length].postMessage({
+                            type: 'decode',
+                            streamIndex: i,
+                            encodedData: encodedData,
+                            width: videoWidth,
+                            height: videoHeight
+                        });
+                    }
+                }
+            };
+        });
     }
 
     async function reconfigureWorkersAndCanvases() {
@@ -226,53 +255,30 @@ function main() {
         forceKeyFrameWasm();
     }
 
-    function processVideoFrame(now, metadata) {
-        if (!processing) return;
+    async function processVideoFrame(now, metadata) {
+        if (!processing) {
+            return;
+        }
         updateFps(metadata.mediaTime);
-        // Create a VideoFrame from the video element.
-        const frame = new VideoFrame(inputVideo, { timestamp: metadata.mediaTime * 1000000 });
         // Decide which implementation to use
         if (implementationSelect.value === 'wasm') {
-            handleWasmFrame(frame);
+            // For Wasm, create a bitmap and transfer it to the encoder worker.
+            // This is very fast and has low main-thread impact.
+            const frameBitmap = await createImageBitmap(inputVideo);
+            encoderWorker.postMessage({
+                type: 'encode',
+                frameBitmap: frameBitmap,
+                width: videoWidth,
+                height: videoHeight,
+            }, [frameBitmap]); // Transfer the bitmap to avoid copying
         } else {
+            // Create a VideoFrame from the video element.
+            const frame = new VideoFrame(inputVideo, { timestamp: metadata.mediaTime * 1000000 });
             handleWebCodecsFrame(frame);
+            frame.close();
         }
-        frame.close();
         // Keep the loop going by requesting the next frame.
         inputVideo.requestVideoFrameCallback(processVideoFrame);
-    }
-
-    function handleWasmFrame(frame) {
-        const t0 = performance.now();
-        tempCtx.drawImage(frame, 0, 0, videoWidth, videoHeight);
-        const imageData = tempCtx.getImageData(0, 0, videoWidth, videoHeight);
-        perfEls.captureTime.textContent = (performance.now() - t0).toFixed(2);
-        HEAPU8.set(imageData.data, rgbaBufferPtr);
-        const encodedDataPtr_ptr = Module._malloc(4);
-        const encodedSize_ptr = Module._malloc(4);
-        const t2 = performance.now();
-        encodeFrameWasm(rgbaBufferPtr, videoWidth, videoHeight, encodedDataPtr_ptr, encodedSize_ptr);
-        perfEls.encodeTime.textContent = (performance.now() - t2).toFixed(2);
-        const encodedDataPtr = Module.getValue(encodedDataPtr_ptr, 'i32');
-        const encodedSize = Module.getValue(encodedSize_ptr, 'i32');
-        Module._free(encodedDataPtr_ptr);
-        Module._free(encodedSize_ptr);
-        if (encodedSize > 0) {
-            const encodedDataCopy = HEAPU8.slice(encodedDataPtr, encodedDataPtr + encodedSize);
-            freeBufferWasm(encodedDataPtr);
-            const numStreams = parseInt(streamCountSelect.value, 10);
-            for (let i = 0; i < numStreams; i++) {
-                workers[i % workers.length].postMessage({
-                    type: 'decode',
-                    streamIndex: i,
-                    encodedData: encodedDataCopy.buffer,
-                    width: videoWidth,
-                    height: videoHeight
-                });
-            }
-        } else if (encodedDataPtr) {
-            freeBufferWasm(encodedDataPtr);
-        }
     }
 
     // --- WebCodecs Implementation ---
