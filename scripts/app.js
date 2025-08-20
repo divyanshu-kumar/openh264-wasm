@@ -145,6 +145,9 @@ function main() {
                 await startWebCodecs();
             }
 
+            processing = true;
+            inputVideo.requestVideoFrameCallback(processVideoFrame);
+
             startButton.textContent = 'Stop Camera';
 
         } catch (error) {
@@ -190,8 +193,6 @@ function main() {
                     } else if (e.data.type === 'init_done') {
                         if (++initDoneCount === numThreads) {
                             setupCanvasesWasm();
-                            processing = true;
-                            requestAnimationFrame(processLoopWasm);
                             resolve();
                         }
                     } else if (e.data.type === 'decoded') {
@@ -225,15 +226,28 @@ function main() {
         forceKeyFrameWasm();
     }
 
-    function processLoopWasm() {
+    function processVideoFrame(now, metadata) {
         if (!processing) return;
-        updateFps();
+        updateFps(metadata.mediaTime);
+        // Create a VideoFrame from the video element.
+        const frame = new VideoFrame(inputVideo, { timestamp: metadata.mediaTime * 1000000 });
+        // Decide which implementation to use
+        if (implementationSelect.value === 'wasm') {
+            handleWasmFrame(frame);
+        } else {
+            handleWebCodecsFrame(frame);
+        }
+        frame.close();
+        // Keep the loop going by requesting the next frame.
+        inputVideo.requestVideoFrameCallback(processVideoFrame);
+    }
+
+    function handleWasmFrame(frame) {
         const t0 = performance.now();
-        tempCtx.drawImage(inputVideo, 0, 0, videoWidth, videoHeight);
+        tempCtx.drawImage(frame, 0, 0, videoWidth, videoHeight);
         const imageData = tempCtx.getImageData(0, 0, videoWidth, videoHeight);
-        const rgbaData = imageData.data;
         perfEls.captureTime.textContent = (performance.now() - t0).toFixed(2);
-        HEAPU8.set(rgbaData, rgbaBufferPtr);
+        HEAPU8.set(imageData.data, rgbaBufferPtr);
         const encodedDataPtr_ptr = Module._malloc(4);
         const encodedSize_ptr = Module._malloc(4);
         const t2 = performance.now();
@@ -249,17 +263,16 @@ function main() {
             const numStreams = parseInt(streamCountSelect.value, 10);
             for (let i = 0; i < numStreams; i++) {
                 workers[i % workers.length].postMessage({
-                    type: 'decode', 
-                    streamIndex: i, 
+                    type: 'decode',
+                    streamIndex: i,
                     encodedData: encodedDataCopy.buffer,
-                    width: videoWidth,  
-                    height: videoHeight  
+                    width: videoWidth,
+                    height: videoHeight
                 });
             }
         } else if (encodedDataPtr) {
             freeBufferWasm(encodedDataPtr);
         }
-        requestAnimationFrame(processLoopWasm);
     }
 
     // --- WebCodecs Implementation ---
@@ -327,21 +340,13 @@ function main() {
             bitrate: 1_000_000,
             framerate: 30,
         });
-        
-        processing = true;
-        inputVideo.requestVideoFrameCallback(processFrameWebCodecs);
     }
 
-    function processFrameWebCodecs(now, metadata) {
-        if (!processing) return;
-        updateFps(metadata.mediaTime);
-        const frame = new VideoFrame(inputVideo, { timestamp: metadata.mediaTime * 1000000 });
-        perfEls.captureTime.textContent = (performance.now() - now).toFixed(2);
+    function handleWebCodecsFrame(frame) {
+        perfEls.captureTime.textContent = '0.00';
         const t2 = performance.now();
         videoEncoder.encode(frame);
         perfEls.encodeTime.textContent = (performance.now() - t2).toFixed(2);
-        frame.close();
-        inputVideo.requestVideoFrameCallback(processFrameWebCodecs);
     }
     
     // --- Shared Functions ---
