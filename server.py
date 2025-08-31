@@ -13,6 +13,7 @@ class MyHttpRequestHandler(http.server.SimpleHTTPRequestHandler):
 Handler = MyHttpRequestHandler
 
 with socketserver.TCPServer(("", PORT), Handler) as httpd:
+    httpd.allow_reuse_address = True
     print("--- COEP/COOP Server Running ---")
     print(f"Serving at: http://localhost:{PORT}")
     print("---------------------------------")

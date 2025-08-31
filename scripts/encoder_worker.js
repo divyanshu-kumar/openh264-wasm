@@ -5,6 +5,7 @@ let encodeFrame;
 let rgbaBufferPtr = 0;
 let rgbaBufferSize = 0;
 
+let isEncoding = false;
 
 // The Wasm module needs to be loaded in the worker
 importScripts('h264.js');
@@ -17,7 +18,7 @@ Module.onRuntimeInitialized = () => {
     self.postMessage({ type: 'ready' });
 };
 
-self.onmessage = (e) => {
+self.onmessage = async (e) => {
     if (!wasmReady) return;
 
     const { type, frameBitmap, width, height } = e.data;
@@ -39,48 +40,58 @@ self.onmessage = (e) => {
         self.postMessage({ type: 'init_done' });
 
     } else if (type === 'encode') {
-        const startTime = performance.now();
-        // Create a temporary 2D canvas to get image data from the ImageBitmap
-        const canvas = new OffscreenCanvas(width, height);
-        const ctx = canvas.getContext('2d', { willReadFrequently: true });
-        ctx.drawImage(frameBitmap, 0, 0);
-        const imageData = ctx.getImageData(0, 0, width, height);
-        const captureEndTime = performance.now();
-
-        // Copy the image data into the Wasm heap
-        HEAPU8.set(imageData.data, rgbaBufferPtr);
-
-        // Allocate memory for the output pointers
-        const encodedDataPtr_ptr = Module._malloc(4);
-        const encodedSize_ptr = Module._malloc(4);
-
-        // Encode the frame
-        encodeFrame(rgbaBufferPtr, width, height, encodedDataPtr_ptr, encodedSize_ptr);
-
-        const encodedDataPtr = Module.getValue(encodedDataPtr_ptr, 'i32');
-        const encodedSize = Module.getValue(encodedSize_ptr, 'i32');
-
-        Module._free(encodedDataPtr_ptr);
-        Module._free(encodedSize_ptr);
-
-        const encodeEndTime = performance.now();
-
-        if (encodedSize > 0) {
-            // Copy the encoded data out of the heap
-            const encodedData = HEAPU8.slice(encodedDataPtr, encodedDataPtr + encodedSize);
-            // Free the buffer that was allocated in C++
-            Module.cwrap('free_buffer', null, ['number'])(encodedDataPtr);
-            
-            // Send the encoded data back to the main thread
-            self.postMessage({
-                type: 'encoded',
-                encodedData: encodedData.buffer,
-                captureTime: (captureEndTime - startTime),
-                encodeTime: (encodeEndTime - captureEndTime)
-            }, [encodedData.buffer]); // Transfer the buffer to avoid copying
+        if (isEncoding) {
+            console.warn("Wasm encoder busy when new frame arrived. Dropping frame to manage backpressure.");
+            if (frameBitmap && frameBitmap.close) frameBitmap.close();
+            return;
         }
-        
-        // Close the ImageBitmap to free its resources
-        frameBitmap.close();
+        isEncoding = true;
+
+        try {
+            const startTime = performance.now();
+            // Convert ImageBitmap into VideoFrame
+            // (required because copyTo works on VideoFrame, not ImageBitmap)
+            const vf = new VideoFrame(frameBitmap, { timestamp: startTime * 1000 });
+            frameBitmap.close(); // release GPU resource immediately
+            // Copy pixel data directly into WASM memory
+            await vf.copyTo(HEAPU8.subarray(rgbaBufferPtr, rgbaBufferPtr + rgbaBufferSize));
+            vf.close();
+            const frameCopyToWasmEndTime = performance.now();
+
+            // Allocate memory for the output pointers
+            const encodedDataPtr_ptr = Module._malloc(4);
+            const encodedSize_ptr = Module._malloc(4);
+
+            // Encode the frame
+            encodeFrame(rgbaBufferPtr, width, height, encodedDataPtr_ptr, encodedSize_ptr);
+
+            const encodedDataPtr = Module.getValue(encodedDataPtr_ptr, 'i32');
+            const encodedSize = Module.getValue(encodedSize_ptr, 'i32');
+
+            Module._free(encodedDataPtr_ptr);
+            Module._free(encodedSize_ptr);
+
+            const encodeEndTime = performance.now();
+
+            if (encodedSize > 0) {
+                // Copy the encoded data out of the heap
+                const encodedData = HEAPU8.slice(encodedDataPtr, encodedDataPtr + encodedSize);
+                // Free the buffer that was allocated in C++
+                Module.cwrap('free_buffer', null, ['number'])(encodedDataPtr);
+
+                // Send the encoded data back to the main thread
+                self.postMessage({
+                    type: 'encoded',
+                    encodedData: encodedData.buffer,
+                    frameCopyToWasmTime: (frameCopyToWasmEndTime - startTime),
+                    encodeTime: (encodeEndTime - frameCopyToWasmEndTime)
+                }, [encodedData.buffer]); // Transfer the buffer to avoid copying
+            }
+
+        } catch (err) {
+            console.error("Error during encoding:", err);
+        } finally {
+            isEncoding = false;
+        }
     }
 };

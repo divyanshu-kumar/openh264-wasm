@@ -188,19 +188,19 @@
                         <p id="outputFps" class="text-2xl font-semibold">--</p>
                     </div>
                     <div>
-                        <p class="text-sm text-gray-400">Capture</p>
-                        <p id="captureTime" class="text-2xl font-semibold">-- ms</p>
+                        <p class="text-sm text-gray-400">Frame copy to WASM time (per frame, ms)</p>
+                        <p id="frameCopyToWasmTime" class="text-2xl font-semibold">-- ms</p>
                     </div>
                     <div>
-                        <p class="text-sm text-gray-400">Encode</p>
+                        <p class="text-sm text-gray-400">Encode time (per frame, ms)</p>
                         <p id="encodeTime" class="text-2xl font-semibold">-- ms</p>
                     </div>
                     <div>
-                        <p class="text-sm text-gray-400">Total Decode</p>
+                        <p class="text-sm text-gray-400">Total Decode time (in ms) per second</p>
                         <p id="decodeTime" class="text-2xl font-semibold">-- ms</p>
                     </div>
                      <div>
-                        <p class="text-sm text-gray-400">Avg. Decode</p>
+                        <p class="text-sm text-gray-400">Avg. Decode time (per frame, ms)</p>
                         <p id="avgDecodeTime" class="text-2xl font-semibold">-- ms</p>
                     </div>
                 </div>
@@ -218,8 +218,9 @@
                                 <th scope="col" class="px-6 py-3">Threads</th>
                                 <th scope="col" class="px-6 py-3">Input FPS</th>
                                 <th scope="col" class="px-6 py-3">Avg. Output FPS</th>
-                                <th scope="col" class="px-6 py-3">Encode (ms)</th>
-                                <th scope="col" class="px-6 py-3">Avg. Decode (ms)</th>
+                                <th scopy="col" class="px-6 py-3">Frame copy to WASM time (ms)</th>
+                                <th scope="col" class="px-6 py-3">Encode (per frame, ms)</th>
+                                <th scope="col" class="px-6 py-3">Avg. Decode (per frame, ms)</th>
                             </tr>
                         </thead>
                         <tbody id="resultsBody">

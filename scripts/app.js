@@ -19,7 +19,7 @@ function main() {
     
     // Performance Stat Elements
     const perfEls = {
-        captureTime: document.getElementById('captureTime'),
+        frameCopyToWasmTime: document.getElementById('frameCopyToWasmTime'),
         encodeTime: document.getElementById('encodeTime'),
         decodeTime: document.getElementById('decodeTime'),
         avgDecodeTime: document.getElementById('avgDecodeTime'),
@@ -40,7 +40,6 @@ function main() {
     let capturedResults = [];
     let workers = [];
     let encoderWorker = null;
-    
 
     // WebCodecs State
     let videoEncoder, decoders = [];
@@ -116,7 +115,7 @@ function main() {
         try {
             statusEl.textContent = 'Status: Starting...';
             const [w, h] = resolutionSelect.value.split('x').map(Number);
-            const constraints = { video: { width: { ideal: w }, height: { ideal: h }, framerate: { ideal: 30 } } };
+            const constraints = { video: { width: { ideal: w }, height: { ideal: h }, framerate: { min: 15, max: 30 } } };
             
             mediaStream = await navigator.mediaDevices.getUserMedia(constraints);
             cameraActive = true;
@@ -172,7 +171,7 @@ function main() {
             encoderWorker = new Worker('scripts/encoder_worker.js');
             encoderWorker.onerror = (err) => reject(err);
             encoderWorker.onmessage = async (e) => {
-                const { type, encodedData, captureTime, encodeTime } = e.data;
+                const { type, encodedData, frameCopyToWasmTime, encodeTime } = e.data;
                 if (type === 'ready') {
                     // Once the worker's Wasm module is ready, initialize the encoder
                     encoderWorker.postMessage({ type: 'init', width: videoWidth, height: videoHeight });
@@ -181,8 +180,8 @@ function main() {
                     await reconfigureWorkersAndCanvases();
                     resolve();
                 } else if (type === 'encoded') {
-                    if (captureTime) {
-                        perfEls.captureTime.textContent = captureTime.toFixed(2);
+                    if (frameCopyToWasmTime) {
+                        perfEls.frameCopyToWasmTime.textContent = frameCopyToWasmTime.toFixed(2);
                     }
                     if (encodeTime) {
                         perfEls.encodeTime.textContent = encodeTime.toFixed(2);
@@ -227,6 +226,9 @@ function main() {
                     } else if (e.data.type === 'decoded') {
                         outputFrameCount++;
                         totalDecodeTimeForFps += e.data.decodeTime;
+                    } else if (e.data.type === 'request_keyframe') {
+                        console.log(`Decoder worker requested a keyframe. Forcing one now.`);
+                        forceKeyFrameWasm();
                     }
                 };
                 workers.push(worker);
@@ -262,15 +264,14 @@ function main() {
         updateFps(metadata.mediaTime);
         // Decide which implementation to use
         if (implementationSelect.value === 'wasm') {
-            // For Wasm, create a bitmap and transfer it to the encoder worker.
-            // This is very fast and has low main-thread impact.
-            const frameBitmap = await createImageBitmap(inputVideo);
-            encoderWorker.postMessage({
-                type: 'encode',
-                frameBitmap: frameBitmap,
-                width: videoWidth,
-                height: videoHeight,
-            }, [frameBitmap]); // Transfer the bitmap to avoid copying
+           createImageBitmap(inputVideo).then(bitmap => {
+                encoderWorker.postMessage({
+                    type: 'encode',
+                    frameBitmap: bitmap,
+                    width: videoWidth,
+                    height: videoHeight,
+                }, [bitmap]);
+            });
         } else {
             // Create a VideoFrame from the video element.
             const frame = new VideoFrame(inputVideo, { timestamp: metadata.mediaTime * 1000000 });
@@ -349,7 +350,7 @@ function main() {
     }
 
     function handleWebCodecsFrame(frame) {
-        perfEls.captureTime.textContent = '0.00';
+        perfEls.frameCopyToWasmTime.textContent = '0.00';
         const t2 = performance.now();
         videoEncoder.encode(frame);
         perfEls.encodeTime.textContent = (performance.now() - t2).toFixed(2);
@@ -384,6 +385,7 @@ function main() {
             streams: streamCountSelect.value, threads: threadCountSelect.value,
             inputFps: perfEls.inputFps.textContent, avgOutputFps: perfEls.outputFps.textContent,
             encodeTime: perfEls.encodeTime.textContent, avgDecodeTime: perfEls.avgDecodeTime.textContent,
+            frameCopyToWasmTime: perfEls.frameCopyToWasmTime.textContent,
         });
         renderResultsTable();
     });
@@ -409,6 +411,7 @@ function main() {
                 <td class="px-6 py-4">${res.implementation === 'wasm' ? res.threads : 'N/A'}</td>
                 <td class="px-6 py-4">${res.inputFps}</td>
                 <td class="px-6 py-4">${res.avgOutputFps}</td>
+                <td class="px-6 py-4">${res.frameCopyToWasmTime}</td>
                 <td class="px-6 py-4">${res.encodeTime}</td>
                 <td class="px-6 py-4">${res.avgDecodeTime}</td>
             `;

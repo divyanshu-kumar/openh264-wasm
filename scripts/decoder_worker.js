@@ -10,15 +10,14 @@ let encodedBufferSize = 0;
 let decodedRgbaBufferPtr = 0;
 let decodedRgbaBufferSize = 0;
 
-// Store canvases and their contexts, mapped by the original stream index.
-const streamContexts = new Map();
+const streamContexts = new Map(); // streamIndex → bitmaprenderer context
 let messageQueue = [];
+let isDecoding = false;
 
 function handleMessage(data) {
     const { type } = data;
 
     if (type === 'set_id') {
-        // This message is now handled before the queue, but we keep this for safety.
         workerId = data.id;
     } else if (type === 'init') {
         console.log(`Worker ${workerId} initializing decoder pool...`);
@@ -29,12 +28,21 @@ function handleMessage(data) {
         }
     } else if (type === 'set_canvas') {
         const { canvas, streamIndex } = data;
-        streamContexts.set(streamIndex, canvas.getContext('2d'));
+        // Use bitmaprenderer context for efficient GPU updates
+        const ctx = canvas.getContext('bitmaprenderer');
+        streamContexts.set(streamIndex, ctx);
         console.log(`Worker ${workerId} has taken control of canvas for stream ${streamIndex}`);
     } else if (type === 'decode') {
+        if (isDecoding) {
+            console.warn(`Decoder ${workerId} busy. Dropping a frame.`);
+            self.postMessage({ type: 'request_keyframe' });
+            return;
+        }
+        isDecoding = true;
         const { streamIndex, encodedData, width, height } = data;
         const context = streamContexts.get(streamIndex);
         if (!context) {
+            isDecoding = false;
             return;
         }
 
@@ -71,18 +79,30 @@ function handleMessage(data) {
         Module._free(decodedHeight_ptr);
 
         if (decodedRgbaBufferPtr && decodedWidth > 0 && decodedHeight > 0) {
+            // Wrap decoded RGBA directly into a VideoFrame
             const dataSize = decodedWidth * decodedHeight * 4;
-            const decodedDataCopy = new Uint8ClampedArray(HEAPU8.subarray(decodedRgbaBufferPtr, decodedRgbaBufferPtr + dataSize));
-            const imageData = new ImageData(decodedDataCopy, decodedWidth, decodedHeight);
-            
-            context.putImageData(imageData, 0, 0);
-            
+            const rgbaView = HEAPU8.subarray(decodedRgbaBufferPtr, decodedRgbaBufferPtr + dataSize);
+
+            const vf = new VideoFrame(rgbaView, {
+                format: "RGBA",
+                codedWidth: decodedWidth,
+                codedHeight: decodedHeight,
+                timestamp: performance.now() * 1000, // µs timestamp
+            });
+
+            // Convert VideoFrame → ImageBitmap (GPU-friendly)
+            createImageBitmap(vf).then((bitmap) => {
+                context.transferFromImageBitmap(bitmap);
+                vf.close();
+            });
+
             self.postMessage({
                 type: 'decoded',
-                streamIndex: streamIndex,
-                decodeTime: t1 - t0
+                streamIndex,
+                decodeTime: (t1 - t0)
             });
         }
+        isDecoding = false;
     }
 }
 
@@ -106,7 +126,7 @@ Module.onRuntimeInitialized = () => {
     decodeFrame = Module.cwrap('decode_frame', null, ['number', 'number', 'number', 'number', 'number', 'number']);
     freeBuffer = Module.cwrap('free_buffer', null, ['number']);
     wasmReady = true;
-    
+
     while (messageQueue.length > 0) {
         handleMessage(messageQueue.shift());
     }
