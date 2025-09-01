@@ -38,7 +38,7 @@ function main() {
     let tempCanvas, tempCtx;
     let mediaStream = null;
     let capturedResults = [];
-    let workers = [];
+    let decoderWorkers = [];
     let encoderWorker = null;
 
     // WebCodecs State
@@ -82,6 +82,42 @@ function main() {
     const encodeFrameWasm = Module.cwrap('encode_frame', null, ['number', 'number', 'number', 'number', 'number']);
     const freeBufferWasm = Module.cwrap('free_buffer', null, ['number']);
 
+    async function shutdownEncoderWorker() {
+        if (encoderWorker) {
+            await new Promise(resolve => {
+                const messageHandler = (event) => {
+                    if (event.data.type === 'cleanup_done') {
+                        encoderWorker.terminate();
+                        encoderWorker = null;
+                        self.removeEventListener('message', messageHandler);
+                        resolve();
+                    }
+                };
+                encoderWorker.addEventListener('message', messageHandler);
+                encoderWorker.postMessage({ type: 'cleanup' });
+            });
+            console.log("Encoder worker has been shut down gracefully.");
+        }
+    }
+
+    async function stopDecoderWorkers() {
+        const shutdownPromises = decoderWorkers.map(worker => {
+            return new Promise(resolve => {
+                const messageHandler = (event) => {
+                    if (event.data.type === 'cleanup_done') {
+                        worker.terminate();
+                        worker.removeEventListener('message', messageHandler);
+                        resolve();
+                    }
+                };
+                worker.addEventListener('message', messageHandler);
+                worker.postMessage({ type: 'cleanup' });
+            });
+        });
+        await Promise.all(shutdownPromises);
+        console.log("All decoderWorkers have been shut down gracefully.");
+        decoderWorkers = [];
+    }
     // --- Main Control Logic ---
     async function stop() {
         if (!cameraActive) return;
@@ -92,12 +128,8 @@ function main() {
             mediaStream.getTracks().forEach(track => track.stop());
             mediaStream = null;
         }
-        if (encoderWorker) {
-            encoderWorker.terminate();
-            encoderWorker = null;
-        }
-        workers.forEach(w => w.terminate());
-        workers = [];
+        await shutdownEncoderWorker();
+        stopDecoderWorkers();
         if (videoEncoder && videoEncoder.state !== 'closed') {
             videoEncoder.close();
         }
@@ -189,7 +221,7 @@ function main() {
                     // When an encoded frame comes back, distribute it to the decoders
                     const numStreams = parseInt(streamCountSelect.value, 10);
                     for (let i = 0; i < numStreams; i++) {
-                        workers[i % workers.length].postMessage({
+                        decoderWorkers[i % decoderWorkers.length].postMessage({
                             type: 'decode',
                             streamIndex: i,
                             encodedData: encodedData,
@@ -205,19 +237,22 @@ function main() {
     async function reconfigureWorkersAndCanvases() {
         processing = false;
         await new Promise(r => setTimeout(r, 50));
+        await stopDecoderWorkers();
         return new Promise((resolve, reject) => {
             const numThreads = parseInt(threadCountSelect.value, 10);
-            workers.forEach(w => w.terminate());
-            workers = [];
             let readyCount = 0, initDoneCount = 0;
-            if (numThreads === 0) return resolve();
+            if (numThreads === 0) {
+                return resolve();
+            }
             for (let i = 0; i < numThreads; i++) {
                 const worker = new Worker('scripts/decoder_worker.js');
                 worker.postMessage({ type: 'set_id', id: i });
                 worker.onerror = (err) => reject(new Error(`Worker error: ${err.message}`));
                 worker.onmessage = (e) => {
                     if (e.data.type === 'ready') {
-                        if (++readyCount === numThreads) workers.forEach(w => w.postMessage({ type: 'init' }));
+                        if (++readyCount === numThreads) {
+                            decoderWorkers.forEach(w => w.postMessage({ type: 'init' }));
+                        }
                     } else if (e.data.type === 'init_done') {
                         if (++initDoneCount === numThreads) {
                             setupCanvasesWasm();
@@ -231,15 +266,17 @@ function main() {
                         forceKeyFrameWasm();
                     }
                 };
-                workers.push(worker);
+                decoderWorkers.push(worker);
             }
         });
     }
 
     function setupCanvasesWasm() {
         const numStreams = parseInt(streamCountSelect.value, 10);
-        const numThreads = workers.length;
-        if (numThreads === 0) return;
+        const numThreads = decoderWorkers.length;
+        if (numThreads === 0) {
+            return;
+        }
         outputContainer.innerHTML = '';
         let canvases = [];
         for (let j = 0; j < numStreams; j++) {
@@ -250,7 +287,7 @@ function main() {
             canvases.push(canvas.transferControlToOffscreen());
         }
         for (let j = 0; j < numStreams; j++) {
-            workers[j % numThreads].postMessage({
+            decoderWorkers[j % numThreads].postMessage({
                 type: 'set_canvas', canvas: canvases[j], streamIndex: j,
             }, [canvases[j]]);
         }
