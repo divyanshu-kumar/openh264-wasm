@@ -12,6 +12,8 @@ let decodedRgbaBufferSize = 0;
 let decodedWidth_ptr = 0;
 let decodedHeight_ptr = 0;
 let deinitDecoderPoolWasm;
+let isSafari = null;
+let format = 'BGRA';
 
 const streamContexts = new Map(); // streamIndex → bitmaprenderer context
 let messageQueue = [];
@@ -31,6 +33,13 @@ function handleMessage(data) {
         }
         decodedWidth_ptr = Module._malloc(4);
         decodedHeight_ptr = Module._malloc(4);
+        // Safari ignores the "BGRA" format hint and always assumes RGBA.
+        // By "mislabeling" our BGRA buffer as RGBA for Safari only,
+        // we trick its rendering engine into swapping the R and B channels back for us.
+        isSafari = /^((?!chrome|android).)*safari/i.test(navigator.userAgent);
+        if (isSafari) {
+            format = 'RGBA';
+        }
     } else if (type === 'set_canvas') {
         const { canvas, streamIndex } = data;
         // Use bitmaprenderer context for efficient GPU updates
@@ -83,7 +92,7 @@ function handleMessage(data) {
             const rgbaView = HEAPU8.subarray(decodedRgbaBufferPtr, decodedRgbaBufferPtr + dataSize);
 
             const vf = new VideoFrame(rgbaView, {
-                format: "RGBA",
+                format: format,
                 codedWidth: decodedWidth,
                 codedHeight: decodedHeight,
                 timestamp: performance.now() * 1000, // µs timestamp
@@ -139,7 +148,7 @@ self.importScripts('h264.js');
 Module.onRuntimeInitialized = () => {
     console.log(`Worker ${workerId}: Wasm module ready.`);
     initDecoderPool = Module.cwrap('init_decoder_pool', 'number', ['number']);
-    decodeFrame = Module.cwrap('decode_frame', null, ['number', 'number', 'number', 'number', 'number', 'number']);
+    decodeFrame = Module.cwrap('decode_frame_optimized', null, ['number', 'number', 'number', 'number', 'number', 'number']);
     freeBuffer = Module.cwrap('free_buffer', null, ['number']);
     deinitDecoderPoolWasm = Module.cwrap('deinit_decoder_pool', null, []);
     wasmReady = true;

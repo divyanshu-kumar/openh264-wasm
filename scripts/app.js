@@ -27,9 +27,14 @@ function main() {
         outputFps: document.getElementById('outputFps'),
     };
 
-    // Results Table Elements
+    // Results Table and Machine Info Elements
     const resultsContainer = document.getElementById('resultsContainer');
     const resultsBody = document.getElementById('resultsBody');
+    const downloadResultsButton = document.getElementById('downloadResultsButton');
+    const machineInfoDisplay = document.getElementById('machineInfoDisplay');
+    const cpuInfoEl = document.getElementById('cpuInfo');
+    const ramInfoEl = document.getElementById('ramInfo');
+
 
     // --- State ---
     let processing = false;
@@ -40,15 +45,18 @@ function main() {
     let capturedResults = [];
     let decoderWorkers = [];
     let encoderWorker = null;
+    let machineInfo = null;
 
     // WebCodecs State
     let videoEncoder, decoders = [];
 
-    // FPS calculation state
-    let lastFpsTime = 0;
+    // --- Stats calculation state ---
+    let statsUpdateInterval = null;
     let inputFrameCount = 0;
     let outputFrameCount = 0;
-    let totalDecodeTimeForFps = 0;
+    let totalEncodeTime = 0;
+    let totalFrameCopyToWasmTime = 0;
+    let totalDecodeTime = 0;
     
     // --- URL Parameter Handling ---
     const urlParams = new URLSearchParams(window.location.search);
@@ -56,6 +64,16 @@ function main() {
     const defaultResolution = urlParams.get('res') || "854x480";
     const defaultStreams = urlParams.get('streams') || "1";
     const defaultThreads = urlParams.get('threads') || "1";
+
+    // --- Machine Info ---
+    async function getMachineInfo() {
+        if (machineInfo) return machineInfo;
+        machineInfo = {
+            cpuCores: navigator.hardwareConcurrency || 'N/A',
+            memory: navigator.deviceMemory || 'N/A',
+        };
+        return machineInfo;
+    }
 
     // --- Populate Dropdowns ---
     const resolutions = {
@@ -118,12 +136,20 @@ function main() {
         console.log("All decoderWorkers have been shut down gracefully.");
         decoderWorkers = [];
     }
+
     // --- Main Control Logic ---
     async function stop() {
         if (!cameraActive) return;
         console.log("Stopping current stream...");
         processing = false;
         cameraActive = false;
+
+        // Stop the periodic stats updater
+        if (statsUpdateInterval) {
+            clearInterval(statsUpdateInterval);
+            statsUpdateInterval = null;
+        }
+
         if (mediaStream) {
             mediaStream.getTracks().forEach(track => track.stop());
             mediaStream = null;
@@ -137,6 +163,14 @@ function main() {
         decoders = [];
         inputVideo.srcObject = null;
         outputContainer.innerHTML = '';
+
+        // Reset performance text
+        Object.values(perfEls).forEach(el => el.textContent = '--');
+        perfEls.decodeTime.textContent = '-- ms';
+        perfEls.avgDecodeTime.textContent = '-- ms';
+        perfEls.encodeTime.textContent = '-- ms';
+        perfEls.frameCopyToWasmTime.textContent = '-- ms';
+
         statusEl.textContent = 'Status: Idle';
         startButton.textContent = 'Start Camera';
         await new Promise(resolve => setTimeout(resolve, 100));
@@ -165,10 +199,13 @@ function main() {
 
             statusEl.textContent = 'Status: Initializing...';
             
-            lastFpsTime = performance.now();
+            // Reset stats counters and start the periodic updater
             inputFrameCount = 0;
             outputFrameCount = 0;
-            totalDecodeTimeForFps = 0;
+            totalEncodeTime = 0;
+            totalFrameCopyToWasmTime = 0;
+            totalDecodeTime = 0;
+            statsUpdateInterval = setInterval(updateStatsDisplay, 1000);
 
             if (implementationSelect.value === 'wasm') {
                 await startWasm();
@@ -212,11 +249,12 @@ function main() {
                     await reconfigureWorkersAndCanvases();
                     resolve();
                 } else if (type === 'encoded') {
+                    // Accumulate stats for the 1-second update interval
                     if (frameCopyToWasmTime) {
-                        perfEls.frameCopyToWasmTime.textContent = frameCopyToWasmTime.toFixed(2);
+                        totalFrameCopyToWasmTime += frameCopyToWasmTime;
                     }
                     if (encodeTime) {
-                        perfEls.encodeTime.textContent = encodeTime.toFixed(2);
+                        totalEncodeTime += encodeTime;
                     }
                     // When an encoded frame comes back, distribute it to the decoders
                     const numStreams = parseInt(streamCountSelect.value, 10);
@@ -260,7 +298,7 @@ function main() {
                         }
                     } else if (e.data.type === 'decoded') {
                         outputFrameCount++;
-                        totalDecodeTimeForFps += e.data.decodeTime;
+                        totalDecodeTime += e.data.decodeTime;
                     } else if (e.data.type === 'request_keyframe') {
                         console.log(`Decoder worker requested a keyframe. Forcing one now.`);
                         forceKeyFrameWasm();
@@ -298,7 +336,8 @@ function main() {
         if (!processing) {
             return;
         }
-        updateFps(metadata.mediaTime);
+        inputFrameCount++; // Increment input frame counter
+        
         // Decide which implementation to use
         if (implementationSelect.value === 'wasm') {
            createImageBitmap(inputVideo).then(bitmap => {
@@ -372,7 +411,7 @@ function main() {
                     decoder.decode(chunk);
                 });
                 const t1 = performance.now();
-                totalDecodeTimeForFps += (t1 - t0);
+                totalDecodeTime += (t1 - t0);
             },
             error: (e) => console.error('WebCodecs encoder error:', e.message),
         });
@@ -387,46 +426,101 @@ function main() {
     }
 
     function handleWebCodecsFrame(frame) {
-        perfEls.frameCopyToWasmTime.textContent = '0.00';
+        totalFrameCopyToWasmTime = 0; // N/A for WebCodecs
         const t2 = performance.now();
         videoEncoder.encode(frame);
-        perfEls.encodeTime.textContent = (performance.now() - t2).toFixed(2);
+        totalEncodeTime += performance.now() - t2;
     }
     
-    // --- Shared Functions ---
-    function updateFps(mediaTime) {
-        const now = performance.now();
-        const delta = now - lastFpsTime;
-        if (delta >= 1000) {
-            const numStreams = parseInt(streamCountSelect.value, 10) || 1;
-            perfEls.inputFps.textContent = (inputFrameCount / (delta / 1000)).toFixed(1);
-            const avgOutputFramesPerSecond = (outputFrameCount / numStreams) / (delta / 1000);
-            perfEls.outputFps.textContent = avgOutputFramesPerSecond.toFixed(1);
-            perfEls.decodeTime.textContent = totalDecodeTimeForFps.toFixed(2);
-            perfEls.avgDecodeTime.textContent = (totalDecodeTimeForFps / outputFrameCount || 0).toFixed(2);
-            lastFpsTime = now;
-            inputFrameCount = 0;
-            outputFrameCount = 0;
-            totalDecodeTimeForFps = 0;
+    // --- Stats Update Function ---
+    function updateStatsDisplay() {
+        if (!processing) {
+            return;
         }
-        inputFrameCount++;
+        const numStreams = parseInt(streamCountSelect.value, 10) || 1;
+
+        // Calculate averages over the last second
+        const avgOutputFps = outputFrameCount / numStreams;
+        const avgEncodeTimeMs = totalEncodeTime / inputFrameCount || 0;
+        const avgDecodeTimeMs = totalDecodeTime / outputFrameCount || 0;
+        const avgFrameCopyToWasmTimeMs = totalFrameCopyToWasmTime / inputFrameCount || 0;
+
+        // Update DOM elements
+        perfEls.inputFps.textContent = inputFrameCount.toFixed(0);
+        perfEls.outputFps.textContent = avgOutputFps.toFixed(0);
+        perfEls.encodeTime.textContent = avgEncodeTimeMs.toFixed(1);
+        perfEls.decodeTime.textContent = totalDecodeTime.toFixed(0);
+        perfEls.avgDecodeTime.textContent = avgDecodeTimeMs.toFixed(1);
+        perfEls.frameCopyToWasmTime.textContent = avgFrameCopyToWasmTimeMs.toFixed(1);
+        
+        // Reset counters for the next interval
+        inputFrameCount = 0;
+        outputFrameCount = 0;
+        totalEncodeTime = 0;
+        totalFrameCopyToWasmTime = 0;
+        totalDecodeTime = 0;
     }
+
 
     // --- Event Listeners ---
     startButton.addEventListener('click', () => { (cameraActive) ? stop() : start(); });
-    resetButton.addEventListener('click', async () => { await stop(); capturedResults = []; renderResultsTable(); });
-    captureButton.addEventListener('click', () => {
+    
+    resetButton.addEventListener('click', async () => { 
+        await stop(); 
+        capturedResults = []; 
+        machineInfo = null; // Clear cached machine info
+        // Clear display text
+        cpuInfoEl.textContent = '--';
+        ramInfoEl.textContent = '--';
+        renderResultsTable(); 
+    });
+
+    captureButton.addEventListener('click', async () => {
         if (!processing) return;
+
+        // Fetch and display machine info ONCE on the first capture
+        if (!machineInfo) {
+            const info = await getMachineInfo();
+            cpuInfoEl.textContent = info.cpuCores;
+            ramInfoEl.textContent = info.memory;
+        }
+
         capturedResults.push({
-            implementation: implementationSelect.value, resolution: `${videoWidth}x${videoHeight}`, 
-            streams: streamCountSelect.value, threads: threadCountSelect.value,
-            inputFps: perfEls.inputFps.textContent, avgOutputFps: perfEls.outputFps.textContent,
-            encodeTime: perfEls.encodeTime.textContent, avgDecodeTime: perfEls.avgDecodeTime.textContent,
+            // Test Config
+            implementation: implementationSelect.value, 
+            resolution: `${videoWidth}x${videoHeight}`, 
+            streams: streamCountSelect.value, 
+            threads: implementationSelect.value === 'wasm' ? threadCountSelect.value : 'N/A',
+            // Performance Metrics
+            inputFps: perfEls.inputFps.textContent, 
+            avgOutputFps: perfEls.outputFps.textContent,
+            encodeTime: perfEls.encodeTime.textContent, 
+            avgDecodeTime: perfEls.avgDecodeTime.textContent,
             frameCopyToWasmTime: perfEls.frameCopyToWasmTime.textContent,
         });
         renderResultsTable();
     });
     
+    downloadResultsButton.addEventListener('click', () => {
+        // Now capture the whole results container including the machine info
+        if (!resultsContainer) return;
+
+        html2canvas(resultsContainer, {
+            backgroundColor: '#1f2937', // A neutral dark background
+            scale: 2 // Use a higher scale for better image quality
+        }).then(canvas => {
+            const link = document.createElement('a');
+            link.href = canvas.toDataURL('image/jpeg', 0.9); // Set format and quality
+            link.download = 'Wasm-vs-WebCodecs-Results.jpg';
+            
+            document.body.appendChild(link);
+            link.click();
+            document.body.removeChild(link);
+        }).catch(err => {
+            console.error('Error generating image from table:', err);
+        });
+    });
+
     implementationSelect.addEventListener('change', () => {
         threadCountSelect.disabled = implementationSelect.value === 'webcodecs';
         if (cameraActive) start();
@@ -436,7 +530,11 @@ function main() {
     threadCountSelect.addEventListener('change', () => { if (cameraActive) start(); });
 
     function renderResultsTable() {
-        resultsContainer.classList.toggle('hidden', capturedResults.length === 0);
+        const hasResults = capturedResults.length > 0;
+        resultsContainer.classList.toggle('hidden', !hasResults);
+        downloadResultsButton.classList.toggle('hidden', !hasResults);
+        machineInfoDisplay.classList.toggle('hidden', !hasResults);
+
         resultsBody.innerHTML = '';
         capturedResults.forEach(res => {
             const row = document.createElement('tr');
@@ -445,7 +543,7 @@ function main() {
                 <td class="px-6 py-4">${res.implementation}</td>
                 <td class="px-6 py-4">${res.resolution}</td>
                 <td class="px-6 py-4">${res.streams}</td>
-                <td class="px-6 py-4">${res.implementation === 'wasm' ? res.threads : 'N/A'}</td>
+                <td class="px-6 py-4">${res.threads}</td>
                 <td class="px-6 py-4">${res.inputFps}</td>
                 <td class="px-6 py-4">${res.avgOutputFps}</td>
                 <td class="px-6 py-4">${res.frameCopyToWasmTime}</td>

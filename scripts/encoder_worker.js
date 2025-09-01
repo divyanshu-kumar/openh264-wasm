@@ -40,7 +40,7 @@ self.onmessage = async (e) => {
         }
         encodedDataPtr_ptr = Module._malloc(4);
         encodedSize_ptr = Module._malloc(4);
-        console.log('Encoder Worker: Initialized');
+        console.log('Encoder Worker: Initialized buffer allocated of size :', requiredSize);
         self.postMessage({ type: 'init_done' });
 
     } else if (type === 'encode') {

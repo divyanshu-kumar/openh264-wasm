@@ -94,19 +94,19 @@
                     <label for="resolutionSelect" class="text-sm mr-2 text-gray-400">Resolution:</label>
                     <select id="resolutionSelect" class="bg-gray-700 border border-gray-600 text-white text-sm rounded-lg focus:ring-blue-500 focus:border-blue-500 p-2">
                         <!-- Options will be populated by JS -->
-                    </select>
+                        </select>
                 </div>
                 <div class="flex items-center">
                     <label for="streamCountSelect" class="text-sm mr-2 text-gray-400">Streams:</label>
                     <select id="streamCountSelect" class="bg-gray-700 border border-gray-600 text-white text-sm rounded-lg focus:ring-blue-500 focus:border-blue-500 p-2">
                         <!-- Options will be populated by JS -->
-                    </select>
+                        </select>
                 </div>
                 <div class="flex items-center">
                     <label for="threadCountSelect" class="text-sm mr-2 text-gray-400">Threads:</label>
                     <select id="threadCountSelect" class="bg-gray-700 border border-gray-600 text-white text-sm rounded-lg focus:ring-blue-500 focus:border-blue-500 p-2">
                         <!-- Options will be populated by JS -->
-                    </select>
+                        </select>
                 </div>
                 <div id="status" class="text-gray-400">Status: Idle</div>
             </div>
@@ -172,7 +172,7 @@
                     <h2 class="text-xl font-semibold mb-2 text-center">Decoded Outputs</h2>
                     <div id="outputContainer" class="bg-gray-800 p-2 rounded-lg">
                         <!-- Canvases will be added here dynamically -->
-                    </div>
+                        </div>
                 </div>
             </div>
 
@@ -207,7 +207,21 @@
             </div>
             
             <div id="resultsContainer" class="mt-8 w-full max-w-7xl mx-auto hidden">
-                <h2 class="text-xl font-semibold mb-2 text-center">Captured Results</h2>
+                <div class="flex justify-between items-center mb-2">
+                    <h2 class="text-xl font-semibold">Captured Results</h2>
+                    <button id="downloadResultsButton" class="hidden bg-green-600 hover:bg-green-700 text-white font-bold py-2 px-3 rounded-lg transition-colors duration-300 flex items-center gap-2">
+                        <svg xmlns="http://www.w3.org/2000/svg" class="h-5 w-5" viewBox="0 0 20 20" fill="currentColor">
+                          <path fill-rule="evenodd" d="M3 17a1 1 0 011-1h12a1 1 0 110 2H4a1 1 0 01-1-1zm3.293-7.707a1 1 0 011.414 0L9 10.586V3a1 1 0 112 0v7.586l1.293-1.293a1 1 0 111.414 1.414l-3 3a1 1 0 01-1.414 0l-3-3a1 1 0 010-1.414z" clip-rule="evenodd" />
+                        </svg>
+                        <span>Download JPEG</span>
+                    </button>
+                </div>
+
+                <div id="machineInfoDisplay" class="hidden text-sm text-gray-400 bg-gray-800 p-4 rounded-lg mb-4 grid grid-cols-1 md:grid-cols-2 gap-x-6 gap-y-2">
+                    <div><strong>CPU Cores:</strong> <span id="cpuInfo">--</span></div>
+                    <div><strong>RAM (GB):</strong> <span id="ramInfo">--</span></div>
+                </div>
+
                 <div class="table-container bg-gray-800 p-4 rounded-lg">
                     <table class="w-full text-sm text-left text-gray-300">
                         <thead class="text-xs text-gray-400 uppercase bg-gray-700">
@@ -225,17 +239,18 @@
                         </thead>
                         <tbody id="resultsBody">
                             <!-- Results will be added here -->
-                        </tbody>
+                            </tbody>
                     </table>
                 </div>
             </div>
             
             <div id="chartsArea" class="mt-8 w-full max-w-7xl mx-auto hidden space-y-8">
                  <!-- Chart groups will be added here by automation.js -->
-            </div>
+                 </div>
         </main>
     </div>
 
+    <script src="https://cdn.jsdelivr.net/npm/html2canvas@1.4.1/dist/html2canvas.min.js"></script>
     <script src="scripts/h264.js"></script>
     <script src="scripts/app.js"></script>
     <script src="scripts/automation.js"></script>

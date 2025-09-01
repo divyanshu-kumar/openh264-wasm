@@ -22,7 +22,8 @@ EMCC_FLAGS = \
 	-s EXPORTED_RUNTIME_METHODS="['cwrap','getValue']" \
 	-s ALLOW_MEMORY_GROWTH=1 \
 	-O3 \
-	-msimd128
+	-msimd128 \
+    -ffast-math
 
 all: $(OUTPUT_JS)
 
