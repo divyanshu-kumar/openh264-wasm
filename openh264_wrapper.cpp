@@ -13,6 +13,8 @@ int decoder_pool_size = 0;
 
 unsigned char* yuv_buffer = nullptr;
 int yuv_buffer_size = 0;
+unsigned char* encoded_buffer = nullptr;
+int encoded_buffer_size = 0;
 
 extern "C" {
 
@@ -131,6 +133,18 @@ int init_decoder_pool(int count) {
     return 0;
 }
 
+EMSCRIPTEN_KEEPALIVE
+void deinit_decoder_pool() {
+    for (int i = 0; i < decoder_pool_size; ++i) {
+        if (decoder_pool[i]) {
+            decoder_pool[i]->Uninitialize();
+            WelsDestroyDecoder(decoder_pool[i]);
+            decoder_pool[i] = nullptr;
+        }
+    }
+    decoder_pool_size = 0;
+}
+
 // --- Frame Processing ---
 EMSCRIPTEN_KEEPALIVE
 void encode_frame(unsigned char* rgba_data, int width, int height, unsigned char** out_data, int* out_size) {
@@ -171,7 +185,13 @@ void encode_frame(unsigned char* rgba_data, int width, int height, unsigned char
         }
     }
     if (total_size == 0) return;
-    unsigned char* encoded_buffer = (unsigned char*)malloc(total_size);
+    if (encoded_buffer_size < total_size) {
+        if (encoded_buffer != nullptr) {
+            free(encoded_buffer);
+        }
+        encoded_buffer = (unsigned char*)malloc(total_size);
+        encoded_buffer_size = total_size;
+    }
     int current_pos = 0;
     for (int i = 0; i < info.iLayerNum; ++i) {
         const SLayerBSInfo& layerInfo = info.sLayerInfo[i];

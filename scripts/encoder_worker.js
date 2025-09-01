@@ -4,6 +4,8 @@ let encodeFrame;
 
 let rgbaBufferPtr = 0;
 let rgbaBufferSize = 0;
+let encodedDataPtr_ptr = 0;
+let encodedSize_ptr = 0;
 
 let isEncoding = false;
 
@@ -36,6 +38,8 @@ self.onmessage = async (e) => {
             rgbaBufferPtr = Module._malloc(requiredSize);
             rgbaBufferSize = requiredSize;
         }
+        encodedDataPtr_ptr = Module._malloc(4);
+        encodedSize_ptr = Module._malloc(4);
         console.log('Encoder Worker: Initialized');
         self.postMessage({ type: 'init_done' });
 
@@ -58,27 +62,16 @@ self.onmessage = async (e) => {
             vf.close();
             const frameCopyToWasmEndTime = performance.now();
 
-            // Allocate memory for the output pointers
-            const encodedDataPtr_ptr = Module._malloc(4);
-            const encodedSize_ptr = Module._malloc(4);
-
             // Encode the frame
             encodeFrame(rgbaBufferPtr, width, height, encodedDataPtr_ptr, encodedSize_ptr);
 
             const encodedDataPtr = Module.getValue(encodedDataPtr_ptr, 'i32');
             const encodedSize = Module.getValue(encodedSize_ptr, 'i32');
-
-            Module._free(encodedDataPtr_ptr);
-            Module._free(encodedSize_ptr);
-
             const encodeEndTime = performance.now();
 
             if (encodedSize > 0) {
                 // Copy the encoded data out of the heap
                 const encodedData = HEAPU8.slice(encodedDataPtr, encodedDataPtr + encodedSize);
-                // Free the buffer that was allocated in C++
-                Module.cwrap('free_buffer', null, ['number'])(encodedDataPtr);
-
                 // Send the encoded data back to the main thread
                 self.postMessage({
                     type: 'encoded',
@@ -93,5 +86,20 @@ self.onmessage = async (e) => {
         } finally {
             isEncoding = false;
         }
+    } else if (type === 'cleanup') {
+        console.log('Encoder Worker: Cleaning up Wasm memory...');
+        if (rgbaBufferPtr) {
+            Module._free(rgbaBufferPtr);
+            rgbaBufferPtr = 0;
+        }
+        if (encodedDataPtr_ptr) {
+            Module._free(encodedDataPtr_ptr);
+            encodedDataPtr_ptr = 0;
+        }
+        if (encodedSize_ptr) {
+            Module._free(encodedSize_ptr);
+            encodedSize_ptr = 0;
+        }
+        self.postMessage({ type: 'cleanup_done' });
     }
 };

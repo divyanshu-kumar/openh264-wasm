@@ -9,6 +9,9 @@ let encodedBufferPtr = 0;
 let encodedBufferSize = 0;
 let decodedRgbaBufferPtr = 0;
 let decodedRgbaBufferSize = 0;
+let decodedWidth_ptr = 0;
+let decodedHeight_ptr = 0;
+let deinitDecoderPoolWasm;
 
 const streamContexts = new Map(); // streamIndex → bitmaprenderer context
 let messageQueue = [];
@@ -26,6 +29,8 @@ function handleMessage(data) {
         } else {
             self.postMessage({ type: 'init_done' });
         }
+        decodedWidth_ptr = Module._malloc(4);
+        decodedHeight_ptr = Module._malloc(4);
     } else if (type === 'set_canvas') {
         const { canvas, streamIndex } = data;
         // Use bitmaprenderer context for efficient GPU updates
@@ -65,18 +70,12 @@ function handleMessage(data) {
             decodedRgbaBufferSize = requiredRgbaSize;
         }
 
-        const decodedWidth_ptr = Module._malloc(4);
-        const decodedHeight_ptr = Module._malloc(4);
-
         const t0 = performance.now();
         decodeFrame(streamIndex, encodedBufferPtr, encodedDataArray.length, decodedRgbaBufferPtr, decodedWidth_ptr, decodedHeight_ptr);
         const t1 = performance.now();
 
         const decodedWidth = Module.getValue(decodedWidth_ptr, 'i32');
         const decodedHeight = Module.getValue(decodedHeight_ptr, 'i32');
-
-        Module._free(decodedWidth_ptr);
-        Module._free(decodedHeight_ptr);
 
         if (decodedRgbaBufferPtr && decodedWidth > 0 && decodedHeight > 0) {
             // Wrap decoded RGBA directly into a VideoFrame
@@ -103,6 +102,23 @@ function handleMessage(data) {
             });
         }
         isDecoding = false;
+    } else if (type === 'cleanup') {
+        console.log(`Worker ${workerId} cleaning up...`);
+        if (encodedBufferPtr) {
+            Module._free(encodedBufferPtr);
+        }
+        if (decodedRgbaBufferPtr) {
+            Module._free(decodedRgbaBufferPtr);
+        }
+        if (decodedWidth_ptr) {
+            Module._free(decodedWidth_ptr);
+        }
+        if (decodedHeight_ptr) {
+            Module._free(decodedHeight_ptr);
+        }
+        deinitDecoderPoolWasm();
+        // You could also add a C-side function to clean up the decoder pool
+        self.postMessage({ type: 'cleanup_done' });
     }
 }
 
@@ -125,6 +141,7 @@ Module.onRuntimeInitialized = () => {
     initDecoderPool = Module.cwrap('init_decoder_pool', 'number', ['number']);
     decodeFrame = Module.cwrap('decode_frame', null, ['number', 'number', 'number', 'number', 'number', 'number']);
     freeBuffer = Module.cwrap('free_buffer', null, ['number']);
+    deinitDecoderPoolWasm = Module.cwrap('deinit_decoder_pool', null, []);
     wasmReady = true;
 
     while (messageQueue.length > 0) {
