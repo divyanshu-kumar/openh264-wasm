@@ -1,9 +1,9 @@
 // This script runs in a separate thread for decoding.
 
 let wasmReady = false;
-let initDecoderPool;
+let initDecoder;
 let decodeFrame;
-let freeBuffer;
+let deinitDecoderWasm;
 let workerId = -1;
 let encodedBufferPtr = 0;
 let encodedBufferSize = 0;
@@ -11,9 +11,9 @@ let decodedRgbaBufferPtr = 0;
 let decodedRgbaBufferSize = 0;
 let decodedWidth_ptr = 0;
 let decodedHeight_ptr = 0;
-let deinitDecoderPoolWasm;
 let isSafari = null;
 let format = 'BGRA';
+let decoderStreamsIdx = [];
 
 const streamContexts = new Map(); // streamIndex → bitmaprenderer context
 let messageQueue = [];
@@ -24,28 +24,24 @@ function handleMessage(data) {
 
     if (type === 'set_id') {
         workerId = data.id;
-    } else if (type === 'init') {
-        console.log(`Worker ${workerId} initializing decoder pool...`);
-        if (initDecoderPool(32) !== 0) { 
-            console.error(`Worker ${workerId} failed to initialize decoder pool.`);
-        } else {
-            self.postMessage({ type: 'init_done' });
-        }
-        decodedWidth_ptr = Module._malloc(4);
-        decodedHeight_ptr = Module._malloc(4);
-        // Safari ignores the "BGRA" format hint and always assumes RGBA.
-        // By "mislabeling" our BGRA buffer as RGBA for Safari only,
-        // we trick its rendering engine into swapping the R and B channels back for us.
-        isSafari = /^((?!chrome|android).)*safari/i.test(navigator.userAgent);
-        if (isSafari) {
-            format = 'RGBA';
-        }
+        decoderStreamsIdx = [];
     } else if (type === 'set_canvas') {
         const { canvas, streamIndex } = data;
+        decoderStreamsIdx.push(streamIndex);
+        // Initialize the specific decoder for this stream index.
+        if (initDecoder(streamIndex) !== 0) {
+            console.error(`Worker ${workerId} failed to init decoder for stream ${streamIndex}`);
+            return;
+        }
+
         // Use bitmaprenderer context for efficient GPU updates
         const ctx = canvas.getContext('bitmaprenderer');
         streamContexts.set(streamIndex, ctx);
         console.log(`Worker ${workerId} has taken control of canvas for stream ${streamIndex}`);
+
+        // Let the main thread know this specific stream is ready.
+        self.postMessage({ type: 'stream_ready', streamIndex });
+
     } else if (type === 'decode') {
         if (isDecoding) {
             console.warn(`Decoder ${workerId} busy. Dropping a frame.`);
@@ -125,7 +121,9 @@ function handleMessage(data) {
         if (decodedHeight_ptr) {
             Module._free(decodedHeight_ptr);
         }
-        deinitDecoderPoolWasm();
+        while (decoderStreamsIdx.length > 0) {
+            deinitDecoderWasm(decoderStreamsIdx.shift());    
+        }
         // You could also add a C-side function to clean up the decoder pool
         self.postMessage({ type: 'cleanup_done' });
     }
@@ -147,11 +145,21 @@ self.onmessage = (e) => {
 self.importScripts('h264.js');
 Module.onRuntimeInitialized = () => {
     console.log(`Worker ${workerId}: Wasm module ready.`);
-    initDecoderPool = Module.cwrap('init_decoder_pool', 'number', ['number']);
+    
+    initDecoder = Module.cwrap('init_decoder', 'number', ['number']);
     decodeFrame = Module.cwrap('decode_frame_optimized', null, ['number', 'number', 'number', 'number', 'number', 'number']);
-    freeBuffer = Module.cwrap('free_buffer', null, ['number']);
-    deinitDecoderPoolWasm = Module.cwrap('deinit_decoder_pool', null, []);
+    deinitDecoderWasm = Module.cwrap('deinit_decoder', 'number', ['number']);
+    
     wasmReady = true;
+
+    // Safari-specific color format handling
+    isSafari = /^((?!chrome|android).)*safari/i.test(navigator.userAgent);
+    if (isSafari) {
+        format = 'RGBA';
+    }
+    
+    decodedWidth_ptr = Module._malloc(4);
+    decodedHeight_ptr = Module._malloc(4);
 
     while (messageQueue.length > 0) {
         handleMessage(messageQueue.shift());

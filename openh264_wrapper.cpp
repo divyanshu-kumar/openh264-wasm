@@ -238,54 +238,45 @@ void force_key_frame() {
 
 // --- Decoder Management ---
 EMSCRIPTEN_KEEPALIVE
-int init_decoder_pool(int count) {
-    for (int i = 0; i < decoder_pool_size; ++i) {
-        if (decoder_pool[i]) {
-            decoder_pool[i]->Uninitialize();
-            WelsDestroyDecoder(decoder_pool[i]);
-            decoder_pool[i] = nullptr;
-        }
-    }
-    decoder_pool_size = 0;
-
-    if (count > MAX_DECODERS) {
-        count = MAX_DECODERS;
+void deinit_decoder(int decoder_index) {
+    if (decoder_index < 0 || decoder_index >= MAX_DECODERS) {
+        return;
     }
 
-    for (int i = 0; i < count; ++i) {
-        ISVCDecoder* dec = nullptr;
-        if (WelsCreateDecoder(&dec) != 0) {
-            std::cerr << "Failed to create decoder #" << i << std::endl;
-            return -1;
-        }
-        SDecodingParam param = {0};
-        param.eEcActiveIdc = ERROR_CON_FRAME_COPY;
-        param.sVideoProperty.eVideoBsType = VIDEO_BITSTREAM_DEFAULT;
-        param.bParseOnly = false;
-        if (dec->Initialize(&param) != 0) {
-            std::cerr << "Failed to initialize decoder #" << i << std::endl;
-            WelsDestroyDecoder(dec);
-            return -1;
-        }
-        int colorFormat = videoFormatI420;
-        dec->SetOption(DECODER_OPTION_END_OF_STREAM, &colorFormat);
-        decoder_pool[i] = dec;
+    if (decoder_pool[decoder_index]) {
+        decoder_pool[decoder_index]->Uninitialize();
+        WelsDestroyDecoder(decoder_pool[decoder_index]);
+        decoder_pool[decoder_index] = nullptr;
     }
-    decoder_pool_size = count;
-    std::cout << "Successfully created " << decoder_pool_size << " decoders." << std::endl;
-    return 0;
 }
 
 EMSCRIPTEN_KEEPALIVE
-void deinit_decoder_pool() {
-    for (int i = 0; i < decoder_pool_size; ++i) {
-        if (decoder_pool[i]) {
-            decoder_pool[i]->Uninitialize();
-            WelsDestroyDecoder(decoder_pool[i]);
-            decoder_pool[i] = nullptr;
-        }
+int init_decoder(int decoder_index) {
+    if (decoder_index < 0 || decoder_index >= MAX_DECODERS) {
+        return -1; // Invalid index
     }
-    decoder_pool_size = 0;
+
+    // Clean up any existing decoder at this index first
+    deinit_decoder(decoder_index);
+
+    ISVCDecoder* dec = nullptr;
+    if (WelsCreateDecoder(&dec) != 0) {
+        std::cerr << "Failed to create decoder #" << decoder_index << std::endl;
+        return -1;
+    }
+
+    SDecodingParam param = {0};
+    param.eEcActiveIdc = ERROR_CON_FRAME_COPY;
+    param.sVideoProperty.eVideoBsType = VIDEO_BITSTREAM_DEFAULT;
+
+    if (dec->Initialize(&param) != 0) {
+        std::cerr << "Failed to initialize decoder #" << decoder_index << std::endl;
+        WelsDestroyDecoder(dec);
+        return -1;
+    }
+    decoder_pool[decoder_index] = dec;
+    std::cout << "Successfully initialized decoder for stream " << decoder_index << std::endl;
+    return 0;
 }
 
 // --- Frame Processing ---
@@ -431,11 +422,15 @@ EMSCRIPTEN_KEEPALIVE
 void decode_frame(int decoder_index, unsigned char* encoded_data, int size, unsigned char* out_rgba_buffer, int* out_width, int* out_height) {
     *out_width = 0;
     *out_height = 0;
-    if (decoder_index < 0 || decoder_index >= decoder_pool_size) {
+    if (decoder_index < 0 || decoder_index >= MAX_DECODERS) {
+        std::cout << "Invalud decoder index : " << decoder_index << ", called on decode_frame";
         return;
     }
     ISVCDecoder* decoder = decoder_pool[decoder_index];
-    if (!decoder) return;
+    if (!decoder) {
+        std::cout << "Decoder unitialized, index : " << decoder_index << ", called on decode_frame";
+        return;
+    }
     SBufferInfo decoded_pict_info = {0};
     unsigned char* decoded_image_yuv[3] = {nullptr, nullptr, nullptr};
     if (decoder->DecodeFrameNoDelay(encoded_data, size, decoded_image_yuv, &decoded_pict_info) != 0 || decoded_pict_info.iBufferStatus != 1) {
@@ -455,11 +450,13 @@ EMSCRIPTEN_KEEPALIVE
 void decode_frame_optimized(int decoder_index, unsigned char* encoded_data, int size, unsigned char* out_rgba_buffer, int* out_width, int* out_height) {
     *out_width = 0;
     *out_height = 0;
-    if (decoder_index < 0 || decoder_index >= decoder_pool_size) {
+    if (decoder_index < 0 || decoder_index >= MAX_DECODERS) {
+        std::cout << "Invalud decoder index : " << decoder_index << ", called on decode_frame";
         return;
     }
     ISVCDecoder* decoder = decoder_pool[decoder_index];
     if (!decoder) {
+        std::cout << "Decoder unitialized, index : " << decoder_index << ", called on decode_frame";
         return;
     }
     

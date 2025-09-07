@@ -95,10 +95,7 @@ function main() {
     threadCountSelect.value = defaultThreads;
     
     // --- C++ Function Wrappers ---
-    const initEncoderWasm = Module.cwrap('init_encoder', 'number', ['number', 'number', 'number']);
     const forceKeyFrameWasm = Module.cwrap('force_key_frame', null, []);
-    const encodeFrameWasm = Module.cwrap('encode_frame', null, ['number', 'number', 'number', 'number', 'number']);
-    const freeBufferWasm = Module.cwrap('free_buffer', null, ['number']);
 
     async function shutdownEncoderWorker() {
         if (encoderWorker) {
@@ -276,24 +273,31 @@ function main() {
         processing = false;
         await new Promise(r => setTimeout(r, 50));
         await stopDecoderWorkers();
+
         return new Promise((resolve, reject) => {
             const numThreads = parseInt(threadCountSelect.value, 10);
-            let readyCount = 0, initDoneCount = 0;
             if (numThreads === 0) {
                 return resolve();
             }
+            const numStreams = parseInt(streamCountSelect.value, 10);
+            let readyCount = 0;
+            let streamReadyCount = 0;
+
             for (let i = 0; i < numThreads; i++) {
                 const worker = new Worker('scripts/decoder_worker.js');
                 worker.postMessage({ type: 'set_id', id: i });
                 worker.onerror = (err) => reject(new Error(`Worker error: ${err.message}`));
+
                 worker.onmessage = (e) => {
                     if (e.data.type === 'ready') {
                         if (++readyCount === numThreads) {
-                            decoderWorkers.forEach(w => w.postMessage({ type: 'init' }));
-                        }
-                    } else if (e.data.type === 'init_done') {
-                        if (++initDoneCount === numThreads) {
                             setupCanvasesWasm();
+                        }
+                    } else if (e.data.type === 'stream_ready') {
+                        streamReadyCount++;
+                        // When all assigned streams have successfully initialized their decoders...
+                        if (streamReadyCount === numStreams) {
+                            processing = true; // It's now safe to start processing frames
                             resolve();
                         }
                     } else if (e.data.type === 'decoded') {
