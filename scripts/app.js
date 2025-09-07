@@ -63,7 +63,7 @@ function main() {
     const defaultImplementation = urlParams.get('impl') || 'wasm';
     const defaultResolution = urlParams.get('res') || "854x480";
     const defaultStreams = urlParams.get('streams') || "1";
-    const defaultThreads = urlParams.get('threads') || "1";
+    const defaultThreads = urlParams.get('threads') || "default";
 
     // --- Machine Info ---
     async function getMachineInfo() {
@@ -86,9 +86,12 @@ function main() {
     for (let i = 1; i <= 32; i++) {
         streamCountSelect.appendChild(new Option(i, i));
     }
+    
+    threadCountSelect.appendChild(new Option('Default (Auto)', 'default'));
     for (let i = 1; i <= (navigator.hardwareConcurrency || 8); i++) {
         threadCountSelect.appendChild(new Option(i, i));
     }
+
     implementationSelect.value = defaultImplementation;
     resolutionSelect.value = defaultResolution;
     streamCountSelect.value = defaultStreams;
@@ -275,11 +278,26 @@ function main() {
         await stopDecoderWorkers();
 
         return new Promise((resolve, reject) => {
-            const numThreads = parseInt(threadCountSelect.value, 10);
+            // --- MODIFICATION: Determine thread count based on selection ---
+            let numThreads;
+            const selectedThreads = threadCountSelect.value;
+            if (selectedThreads === 'default') {
+                // Probe hardware concurrency and leave 2 for the main and encoder thread.
+                const hardwareConcurrency = navigator.hardwareConcurrency || 2; // Use 2 as a fallback.
+                numThreads = Math.max(1, hardwareConcurrency - 2);
+                console.log(`"Default" threads selected. Using ${numThreads} based on hardware concurrency of ${hardwareConcurrency}.`);
+            } else {
+                numThreads = parseInt(selectedThreads, 10);
+            }
+            
             if (numThreads === 0) {
                 return resolve();
             }
             const numStreams = parseInt(streamCountSelect.value, 10);
+            if (selectedThreads === 'default' && numThreads > numStreams ) {
+                numThreads = Math.max(1, numStreams);
+                console.log(`"Default" threads selected. NumStreams lesser than available threads, now using ${numThreads}.`);
+            }
             let readyCount = 0;
             let streamReadyCount = 0;
 
@@ -488,13 +506,17 @@ function main() {
             cpuInfoEl.textContent = info.cpuCores;
             ramInfoEl.textContent = info.memory;
         }
+        
+        const threadsDisplay = implementationSelect.value === 'wasm' 
+            ? decoderWorkers.length 
+            : 'N/A';
 
         capturedResults.push({
             // Test Config
             implementation: implementationSelect.value, 
             resolution: `${videoWidth}x${videoHeight}`, 
             streams: streamCountSelect.value, 
-            threads: implementationSelect.value === 'wasm' ? threadCountSelect.value : 'N/A',
+            threads: threadsDisplay,
             // Performance Metrics
             inputFps: perfEls.inputFps.textContent, 
             avgOutputFps: perfEls.outputFps.textContent,
