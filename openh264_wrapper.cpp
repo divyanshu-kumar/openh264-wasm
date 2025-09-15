@@ -186,9 +186,9 @@ void yuv_to_rgba_optimized(
             int g = (c - cg_cb_table[u_plane[u_idx]] - cg_cr_table[v_plane[v_idx]] + 128) >> 8;
             int b = (c + cb_table[u_plane[u_idx]] + 128) >> 8;
             
-            rgba[rgba_idx++] = std::max(0, std::min(255, b)); // Blue
-            rgba[rgba_idx++] = std::max(0, std::min(255, g)); // Green
             rgba[rgba_idx++] = std::max(0, std::min(255, r)); // Red
+            rgba[rgba_idx++] = std::max(0, std::min(255, g)); // Green
+            rgba[rgba_idx++] = std::max(0, std::min(255, b)); // Blue
             rgba[rgba_idx++] = 255;                           // Alpha
         }
     }
@@ -279,41 +279,7 @@ int init_decoder(int decoder_index) {
     return 0;
 }
 
-// --- Frame Processing ---
-EMSCRIPTEN_KEEPALIVE
-void encode_frame(unsigned char* rgba_data, int width, int height, unsigned char** out_data, int* out_size) {
-    *out_data = nullptr;
-    *out_size = 0;
-    if (!encoder) {
-        return;
-    }
-    SFrameBSInfo info;
-    memset(&info, 0, sizeof(SFrameBSInfo));
-    SSourcePicture pic;
-    memset(&pic, 0, sizeof(SSourcePicture));
-    pic.iPicWidth = width;
-    pic.iPicHeight = height;
-    pic.iColorFormat = videoFormatI420;
-    int y_size = width * height;
-    int uv_size = y_size / 4;
-    int required_size = y_size + 2 * uv_size;
-    if (required_size > yuv_buffer_size) {
-        if (yuv_buffer) {
-            free(yuv_buffer);
-        }
-        yuv_buffer = (unsigned char*)malloc(required_size);
-        yuv_buffer_size = required_size;
-    }
-    pic.pData[0] = yuv_buffer;
-    pic.pData[1] = pic.pData[0] + y_size;
-    pic.pData[2] = pic.pData[1] + uv_size;
-    pic.iStride[0] = width;
-    pic.iStride[1] = width / 2;
-    pic.iStride[2] = width / 2;
-    rgba_to_yuv(rgba_data, width, height, pic.pData[0], pic.pData[1], pic.pData[2]);
-    if (encoder->EncodeFrame(&pic, &info) != cmResultSuccess) {
-        return;
-    }
+void copy_encoded_data(SFrameBSInfo& info, unsigned char** out_data, int* out_size) {
     int total_size = 0;
     for (int i = 0; i < info.iLayerNum; ++i) {
         for (int j = 0; j < info.sLayerInfo[i].iNalCount; ++j) {
@@ -341,12 +307,13 @@ void encode_frame(unsigned char* rgba_data, int width, int height, unsigned char
         }
     }
     *out_data = encoded_buffer;
-    *out_size = encoded_buffer_size;
+    *out_size = total_size;
 }
 
-// Optimized encoding with buffer pooling
+
+// --- Frame Processing ---
 EMSCRIPTEN_KEEPALIVE
-void encode_frame_optimized(unsigned char* rgba_data, int width, int height, unsigned char** out_data, int* out_size) {
+void encode_frame(unsigned char* rgba_data, int width, int height, unsigned char** out_data, int* out_size) {
     *out_data = nullptr;
     *out_size = 0;
     if (!encoder) {
@@ -359,7 +326,7 @@ void encode_frame_optimized(unsigned char* rgba_data, int width, int height, uns
     pic.iPicWidth = width;
     pic.iPicHeight = height;
     pic.iColorFormat = videoFormatI420;
-    
+
     int y_size = width * height;
     int uv_size = y_size / 4;
     int required_size = y_size + 2 * uv_size;
@@ -378,80 +345,54 @@ void encode_frame_optimized(unsigned char* rgba_data, int width, int height, uns
     pic.iStride[0] = width;
     pic.iStride[1] = width / 2;
     pic.iStride[2] = width / 2;
-    
-    rgba_to_yuv_optimized(rgba_data, width, height, pic.pData[0], pic.pData[1], pic.pData[2]);
+
+    rgba_to_yuv(rgba_data, width, height, pic.pData[0], pic.pData[1], pic.pData[2]);
     
     if (encoder->EncodeFrame(&pic, &info) != cmResultSuccess) {
         return;
     }
     
-    int total_size = 0;
-    for (int i = 0; i < info.iLayerNum; ++i) {
-        for (int j = 0; j < info.sLayerInfo[i].iNalCount; ++j) {
-            total_size += info.sLayerInfo[i].pNalLengthInByte[j];
-        }
-    }
-    if (total_size == 0) {
-        return;
-    }
-    if (encoded_buffer_size < total_size) {
-        if (encoded_buffer != nullptr) {
-            free(encoded_buffer);
-            encoded_buffer_size = 0;
-        }
-        encoded_buffer = (unsigned char*)malloc(total_size);
-        encoded_buffer_size = total_size;
-    }
-    int current_pos = 0;
-    for (int i = 0; i < info.iLayerNum; ++i) {
-        const SLayerBSInfo& layerInfo = info.sLayerInfo[i];
-        int layer_size = 0;
-        for (int j = 0; j < layerInfo.iNalCount; j++) {
-            layer_size += layerInfo.pNalLengthInByte[j];
-        }
-        if (layer_size > 0) {
-            memcpy(encoded_buffer + current_pos, layerInfo.pBsBuf, layer_size);
-            current_pos += layer_size;
-        }
-    }
-    *out_data = encoded_buffer;
-    *out_size = encoded_buffer_size;
+    copy_encoded_data(info, out_data, out_size);
 }
 
 EMSCRIPTEN_KEEPALIVE
-void decode_frame(int decoder_index, unsigned char* encoded_data, int size, unsigned char* out_rgba_buffer, int* out_width, int* out_height) {
-    *out_width = 0;
-    *out_height = 0;
-    if (decoder_index < 0 || decoder_index >= MAX_DECODERS) {
-        std::cout << "Invalud decoder index : " << decoder_index << ", called on decode_frame";
+void encode_frame_yuv_i420(unsigned char* yuv_i420_data, int width, int height, unsigned char** out_data, int* out_size) {
+    *out_data = nullptr;
+    *out_size = 0;
+    if (!encoder) {
         return;
     }
-    ISVCDecoder* decoder = decoder_pool[decoder_index];
-    if (!decoder) {
-        std::cout << "Decoder unitialized, index : " << decoder_index << ", called on decode_frame";
+
+    SFrameBSInfo info;
+    memset(&info, 0, sizeof(SFrameBSInfo));
+    SSourcePicture pic;
+    memset(&pic, 0, sizeof(SSourcePicture));
+    pic.iPicWidth = width;
+    pic.iPicHeight = height;
+    pic.iColorFormat = videoFormatI420;
+
+    int y_size = width * height;
+    int uv_size = y_size / 4;
+
+    pic.pData[0] = yuv_i420_data;
+    pic.pData[1] = yuv_i420_data + y_size;
+    pic.pData[2] = yuv_i420_data + y_size + uv_size;
+    pic.iStride[0] = width;
+    pic.iStride[1] = width / 2;
+    pic.iStride[2] = width / 2;
+
+    if (encoder->EncodeFrame(&pic, &info) != cmResultSuccess) {
         return;
     }
-    SBufferInfo decoded_pict_info = {0};
-    unsigned char* decoded_image_yuv[3] = {nullptr, nullptr, nullptr};
-    if (decoder->DecodeFrameNoDelay(encoded_data, size, decoded_image_yuv, &decoded_pict_info) != 0 || decoded_pict_info.iBufferStatus != 1) {
-        return;
-    }
-    int decoded_width = decoded_pict_info.UsrData.sSystemBuffer.iWidth;
-    int decoded_height = decoded_pict_info.UsrData.sSystemBuffer.iHeight;
-    int y_stride = decoded_pict_info.UsrData.sSystemBuffer.iStride[0];
-    int uv_stride = decoded_pict_info.UsrData.sSystemBuffer.iStride[1];
-    yuv_to_rgba(decoded_image_yuv[0], decoded_image_yuv[1], decoded_image_yuv[2], decoded_width, decoded_height, y_stride, uv_stride, out_rgba_buffer);
-    *out_width = decoded_width;
-    *out_height = decoded_height;
+
+    copy_encoded_data(info, out_data, out_size);
 }
 
-// Optimized decoding
 EMSCRIPTEN_KEEPALIVE
 void decode_frame_optimized(int decoder_index, unsigned char* encoded_data, int size, unsigned char* out_rgba_buffer, int* out_width, int* out_height) {
     *out_width = 0;
     *out_height = 0;
-    if (decoder_index < 0 || decoder_index >= MAX_DECODERS) {
-        std::cout << "Invalud decoder index : " << decoder_index << ", called on decode_frame";
+    if (decoder_index < 0 || decoder_index >= MAX_DECODERS || !decoder_pool[decoder_index]) {
         return;
     }
     ISVCDecoder* decoder = decoder_pool[decoder_index];
@@ -463,7 +404,7 @@ void decode_frame_optimized(int decoder_index, unsigned char* encoded_data, int 
     SBufferInfo decoded_pict_info = {0};
     unsigned char* decoded_image_yuv[3] = {nullptr, nullptr, nullptr};
     
-    if (decoder->DecodeFrameNoDelay(encoded_data, size, decoded_image_yuv, &decoded_pict_info) != 0 || 
+    if (decoder->DecodeFrameNoDelay(encoded_data, size, decoded_image_yuv, &decoded_pict_info) != 0 ||
         decoded_pict_info.iBufferStatus != 1) {
         return;
     }
@@ -478,6 +419,48 @@ void decode_frame_optimized(int decoder_index, unsigned char* encoded_data, int 
     
     *out_width = decoded_width;
     *out_height = decoded_height;
+}
+
+EMSCRIPTEN_KEEPALIVE
+void decode_frame_yuv_i420(int decoder_index, unsigned char* encoded_data, int size, unsigned char* out_yuv_buffer, int* out_width, int* out_height) {
+    *out_width = 0; *out_height = 0;
+    if (decoder_index < 0 || decoder_index >= MAX_DECODERS || !decoder_pool[decoder_index]) {
+        return;
+    }
+
+    ISVCDecoder* decoder = decoder_pool[decoder_index];
+    SBufferInfo decoded_pict_info = {0};
+    unsigned char* decoded_image_yuv[3] = {nullptr, nullptr, nullptr};
+
+    if (decoder->DecodeFrameNoDelay(encoded_data, size, decoded_image_yuv, &decoded_pict_info) != 0 || decoded_pict_info.iBufferStatus != 1) {
+        return;
+    }
+
+    int decoded_width = decoded_pict_info.UsrData.sSystemBuffer.iWidth;
+    int decoded_height = decoded_pict_info.UsrData.sSystemBuffer.iHeight;
+    *out_width = decoded_width;
+    *out_height = decoded_height;
+
+    int y_stride = decoded_pict_info.UsrData.sSystemBuffer.iStride[0];
+    int uv_stride = decoded_pict_info.UsrData.sSystemBuffer.iStride[1];
+
+    int uv_height = decoded_height / 2;
+    int uv_width = decoded_width / 2;
+
+    unsigned char* out_ptr = out_yuv_buffer;
+
+    for(int i = 0; i < decoded_height; i++) {
+        memcpy(out_ptr, decoded_image_yuv[0] + i * y_stride, decoded_width);
+        out_ptr += decoded_width;
+    }
+    for(int i = 0; i < uv_height; i++) {
+        memcpy(out_ptr, decoded_image_yuv[1] + i * uv_stride, uv_width);
+        out_ptr += uv_width;
+    }
+    for(int i = 0; i < uv_height; i++) {
+        memcpy(out_ptr, decoded_image_yuv[2] + i * uv_stride, uv_width);
+        out_ptr += uv_width;
+    }
 }
 
 EMSCRIPTEN_KEEPALIVE

@@ -4,7 +4,7 @@ Module.onRuntimeInitialized = () => {
     main();
 };
 
-function main() {
+async function main() {
     // --- DOM Elements ---
     const startButton = document.getElementById('startButton');
     const resetButton = document.getElementById('resetButton');
@@ -49,6 +49,14 @@ function main() {
 
     // WebCodecs State
     let videoEncoder, decoders = [];
+    
+    // WebGPU State
+    let gpuDevice = null;
+    let rgbaToYuvPipeline = null;
+    let rgbaTexture = null;
+    let yBuffer, uBuffer, vBuffer, yuvReadbackBuffer;
+    let yBufferSize, uBufferSize, vBufferSize, yuvBufferSize;
+
 
     // --- Stats calculation state ---
     let statsUpdateInterval = null;
@@ -100,6 +108,41 @@ function main() {
     // --- C++ Function Wrappers ---
     const forceKeyFrameWasm = Module.cwrap('force_key_frame', null, []);
 
+    // --- WebGPU Initialization ---
+    async function initWebGPU() {
+        if (!navigator.gpu) {
+            console.warn("WebGPU not supported. Disabling WASM+WebGPU mode.");
+            const wasmGpuOption = implementationSelect.querySelector('option[value="wasm_webgpu"]');
+            if (wasmGpuOption) {
+                wasmGpuOption.disabled = true;
+            }
+            const wasmGpuCheckbox = document.querySelector('#implCheckboxes input[value="wasm_webgpu"]');
+            if(wasmGpuCheckbox) {
+                wasmGpuCheckbox.disabled = true;
+                wasmGpuCheckbox.parentElement.style.opacity = 0.5;
+            }
+            return false;
+        }
+        try {
+            const adapter = await navigator.gpu.requestAdapter();
+            if (!adapter) {
+                throw new Error('No GPU adapter found.');
+            }
+            gpuDevice = await adapter.requestDevice();
+            console.log("WebGPU device initialized successfully.");
+            return true;
+        } catch (e) {
+            console.error("Failed to initialize WebGPU:", e);
+             const wasmGpuOption = implementationSelect.querySelector('option[value="wasm_webgpu"]');
+            if (wasmGpuOption) {
+                wasmGpuOption.disabled = true;
+            }
+            return false;
+        }
+    }
+    
+    await initWebGPU();
+
     async function shutdownEncoderWorker() {
         if (encoderWorker) {
             await new Promise(resolve => {
@@ -125,10 +168,12 @@ function main() {
                     if (event.data.type === 'cleanup_done') {
                         worker.terminate();
                         worker.removeEventListener('message', messageHandler);
+						self.removeEventListener('error', messageHandler);
                         resolve();
                     }
                 };
                 worker.addEventListener('message', messageHandler);
+				worker.addEventListener('error', messageHandler);
                 worker.postMessage({ type: 'cleanup' });
             });
         });
@@ -144,7 +189,9 @@ function main() {
         processing = false;
         cameraActive = false;
 
-        // Stop the periodic stats updater
+        // Give a moment for any in-flight requestVideoFrameCallback to complete
+        await new Promise(r => setTimeout(r, 50)); 
+
         if (statsUpdateInterval) {
             clearInterval(statsUpdateInterval);
             statsUpdateInterval = null;
@@ -155,7 +202,7 @@ function main() {
             mediaStream = null;
         }
         await shutdownEncoderWorker();
-        stopDecoderWorkers();
+        await stopDecoderWorkers();
         if (videoEncoder && videoEncoder.state !== 'closed') {
             videoEncoder.close();
         }
@@ -207,8 +254,11 @@ function main() {
             totalDecodeTime = 0;
             statsUpdateInterval = setInterval(updateStatsDisplay, 1000);
 
-            if (implementationSelect.value === 'wasm') {
+            const selectedImpl = implementationSelect.value;
+            if (selectedImpl === 'wasm') {
                 await startWasm();
+            } else if (selectedImpl === 'wasm_webgpu') {
+                await startWasmWebGPU();
             } else {
                 await startWebCodecs();
             }
@@ -224,16 +274,10 @@ function main() {
             await stop();
         }
     }
-
-    // --- Wasm Implementation ---
-    async function startWasm() {
-        tempCanvas = document.createElement('canvas');
-        tempCanvas.width = videoWidth;
-        tempCanvas.height = videoHeight;
-        tempCtx = tempCanvas.getContext('2d', { willReadFrequently: true });
-
+    
+    async function setupEncoderWorker(onInitDone) {
         if (encoderWorker) {
-            encoderWorker.terminate();
+            await shutdownEncoderWorker();
         }
 
         return new Promise((resolve, reject) => {
@@ -245,11 +289,9 @@ function main() {
                     // Once the worker's Wasm module is ready, initialize the encoder
                     encoderWorker.postMessage({ type: 'init', width: videoWidth, height: videoHeight });
                 } else if (type === 'init_done') {
-                    // Once the encoder is initialized, set up the decoder workers
-                    await reconfigureWorkersAndCanvases();
+                    await onInitDone();
                     resolve();
                 } else if (type === 'encoded') {
-                    // Accumulate stats for the 1-second update interval
                     if (frameCopyToWasmTime) {
                         totalFrameCopyToWasmTime += frameCopyToWasmTime;
                     }
@@ -272,13 +314,63 @@ function main() {
         });
     }
 
+    // --- Wasm Implementation ---
+    async function startWasm() {
+        tempCanvas = document.createElement('canvas');
+        tempCanvas.width = videoWidth;
+        tempCanvas.height = videoHeight;
+        tempCtx = tempCanvas.getContext('2d', { willReadFrequently: true });
+        
+        await setupEncoderWorker(reconfigureWorkersAndCanvases);
+    }
+    
+    // --- Wasm with WebGPU Implementation ---
+    async function startWasmWebGPU() {
+        if (!gpuDevice) {
+            throw new Error("WebGPU is not initialized. Cannot start in WebGPU mode.");
+        }
+        
+        tempCanvas = document.createElement('canvas');
+        tempCanvas.width = videoWidth;
+        tempCanvas.height = videoHeight;
+        tempCtx = tempCanvas.getContext('2d');
+        
+        // --- Create WebGPU resources for RGBA -> YUV conversion ---
+        yBufferSize = videoWidth * videoHeight * 4; // Use 4 bytes for f32
+        uBufferSize = (videoWidth * videoHeight / 4) * 4; // Use 4 bytes for f32
+        vBufferSize = uBufferSize;
+        yuvBufferSize = yBufferSize + uBufferSize + vBufferSize;
+
+        rgbaTexture = gpuDevice.createTexture({
+            size: [videoWidth, videoHeight],
+            format: 'rgba8unorm',
+            usage: GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.COPY_DST | GPUTextureUsage.RENDER_ATTACHMENT,
+        });
+
+        yBuffer = gpuDevice.createBuffer({ size: yBufferSize, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC });
+        uBuffer = gpuDevice.createBuffer({ size: uBufferSize, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC });
+        vBuffer = gpuDevice.createBuffer({ size: vBufferSize, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC });
+        yuvReadbackBuffer = gpuDevice.createBuffer({ size: yuvBufferSize, usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ });
+
+        const shaderModule = gpuDevice.createShaderModule({ code: rgbaToYuvShaderCode });
+        rgbaToYuvPipeline = await gpuDevice.createComputePipelineAsync({
+            layout: 'auto',
+            compute: { module: shaderModule, entryPoint: 'main' }
+        });
+        
+        await setupEncoderWorker(reconfigureWorkersAndCanvases);
+    }
+
+
     async function reconfigureWorkersAndCanvases() {
         processing = false;
         await new Promise(r => setTimeout(r, 50));
         await stopDecoderWorkers();
+        
+        const isWebGpuMode = implementationSelect.value === 'wasm_webgpu';
 
         return new Promise((resolve, reject) => {
-            // --- MODIFICATION: Determine thread count based on selection ---
+            // --- Determine thread count based on selection ---
             let numThreads;
             const selectedThreads = threadCountSelect.value;
             if (selectedThreads === 'default') {
@@ -309,7 +401,7 @@ function main() {
                 worker.onmessage = (e) => {
                     if (e.data.type === 'ready') {
                         if (++readyCount === numThreads) {
-                            setupCanvasesWasm();
+                            setupCanvases(isWebGpuMode);
                         }
                     } else if (e.data.type === 'stream_ready') {
                         streamReadyCount++;
@@ -331,7 +423,7 @@ function main() {
         });
     }
 
-    function setupCanvasesWasm() {
+    function setupCanvases(isWebGpuMode) {
         const numStreams = parseInt(streamCountSelect.value, 10);
         const numThreads = decoderWorkers.length;
         if (numThreads === 0) {
@@ -346,22 +438,93 @@ function main() {
             canvas.height = videoHeight;
             canvases.push(canvas.transferControlToOffscreen());
         }
+        
+        const messageType = isWebGpuMode ? 'set_canvas_webgpu' : 'set_canvas';
         for (let j = 0; j < numStreams; j++) {
             decoderWorkers[j % numThreads].postMessage({
-                type: 'set_canvas', canvas: canvases[j], streamIndex: j,
+                type: messageType, canvas: canvases[j], streamIndex: j,
             }, [canvases[j]]);
         }
         forceKeyFrameWasm();
+    }
+    
+    async function processVideoFrameWasmWebGPU(now, metadata) {
+        const t0 = performance.now();
+        
+        // 1. Draw video frame to a temporary 2D canvas.
+        tempCtx.drawImage(inputVideo, 0, 0, videoWidth, videoHeight);
+
+        // 2. Copy the canvas content to our GPU texture.
+        gpuDevice.queue.copyExternalImageToTexture(
+            { source: tempCanvas },
+            { texture: rgbaTexture },
+            [videoWidth, videoHeight]
+        );
+
+        // 3. Create bind group and run the compute shader.
+        const bindGroup = gpuDevice.createBindGroup({
+            layout: rgbaToYuvPipeline.getBindGroupLayout(0),
+            entries: [
+                { binding: 0, resource: rgbaTexture.createView() },
+                { binding: 1, resource: { buffer: yBuffer } },
+                { binding: 2, resource: { buffer: uBuffer } },
+                { binding: 3, resource: { buffer: vBuffer } },
+            ],
+        });
+        
+        const commandEncoder = gpuDevice.createCommandEncoder();
+        const passEncoder = commandEncoder.beginComputePass();
+        passEncoder.setPipeline(rgbaToYuvPipeline);
+        passEncoder.setBindGroup(0, bindGroup);
+        passEncoder.dispatchWorkgroups(Math.ceil(videoWidth / 8), Math.ceil(videoHeight / 8));
+        passEncoder.end();
+
+        // 4. Copy the resulting Y, U, and V buffers into a single readback buffer.
+        commandEncoder.copyBufferToBuffer(yBuffer, 0, yuvReadbackBuffer, 0, yBufferSize);
+        commandEncoder.copyBufferToBuffer(uBuffer, 0, yuvReadbackBuffer, yBufferSize, uBufferSize);
+        commandEncoder.copyBufferToBuffer(vBuffer, 0, yuvReadbackBuffer, yBufferSize + uBufferSize, vBufferSize);
+        
+        gpuDevice.queue.submit([commandEncoder.finish()]);
+
+        // 5. Map the readback buffer and get the YUV data.
+        await yuvReadbackBuffer.mapAsync(GPUMapMode.READ);
+        const gpuReadbackArray = yuvReadbackBuffer.getMappedRange();
+        
+        const yLen = videoWidth * videoHeight;
+        const uLen = yLen / 4;
+        const vLen = uLen;
+        
+        const yFloat = new Float32Array(gpuReadbackArray, 0, yLen);
+        const uFloat = new Float32Array(gpuReadbackArray, yBufferSize, uLen);
+        const vFloat = new Float32Array(gpuReadbackArray, yBufferSize + uBufferSize, vLen);
+
+        const yuvData = new Uint8Array(yLen + uLen + vLen);
+        yuvData.set(yFloat);
+        yuvData.set(uFloat, yLen);
+        yuvData.set(vFloat, yLen + uLen);
+
+        yuvReadbackBuffer.unmap();
+        
+        const t1 = performance.now();
+        
+        // 6. Send the YUV data to the encoder worker.
+        encoderWorker.postMessage({
+            type: 'encode_yuv',
+            yuvData: yuvData.buffer,
+            width: videoWidth,
+            height: videoHeight,
+            convertTime: t1-t0
+        }, [yuvData.buffer]);
     }
 
     async function processVideoFrame(now, metadata) {
         if (!processing) {
             return;
         }
-        inputFrameCount++; // Increment input frame counter
+        inputFrameCount++;
         
-        // Decide which implementation to use
-        if (implementationSelect.value === 'wasm') {
+        const selectedImpl = implementationSelect.value;
+        if (selectedImpl === 'wasm') {
            createImageBitmap(inputVideo).then(bitmap => {
                 encoderWorker.postMessage({
                     type: 'encode',
@@ -370,6 +533,8 @@ function main() {
                     height: videoHeight,
                 }, [bitmap]);
             });
+        } else if (selectedImpl === 'wasm_webgpu') {
+            await processVideoFrameWasmWebGPU(now, metadata);
         } else {
             // Create a VideoFrame from the video element.
             const frame = new VideoFrame(inputVideo, { timestamp: metadata.mediaTime * 1000000 });
@@ -507,7 +672,7 @@ function main() {
             ramInfoEl.textContent = info.memory;
         }
         
-        const threadsDisplay = implementationSelect.value === 'wasm' 
+        const threadsDisplay = implementationSelect.value.startsWith('wasm')
             ? decoderWorkers.length 
             : 'N/A';
 
@@ -548,7 +713,7 @@ function main() {
     });
 
     implementationSelect.addEventListener('change', () => {
-        threadCountSelect.disabled = implementationSelect.value === 'webcodecs';
+        threadCountSelect.disabled = !implementationSelect.value.startsWith('wasm');
         if (cameraActive) start();
     });
     resolutionSelect.addEventListener('change', () => { if (cameraActive) start(); });
@@ -588,7 +753,7 @@ function main() {
             avgOutputFps: parseFloat(perfEls.outputFps.textContent),
             avgDecodeTime: parseFloat(perfEls.avgDecodeTime.textContent)
         }),
-        setImplementation: (impl) => { implementationSelect.value = impl; threadCountSelect.disabled = impl === 'webcodecs'; },
+        setImplementation: (impl) => { implementationSelect.value = impl; threadCountSelect.disabled = !impl.startsWith('wasm'); },
         setResolution: (res) => { resolutionSelect.value = res; },
         setStreams: (streams) => { streamCountSelect.value = streams; },
         setThreads: (threads) => { threadCountSelect.value = threads; },
@@ -596,5 +761,5 @@ function main() {
     };
 
     // Initial setup
-    threadCountSelect.disabled = implementationSelect.value === 'webcodecs';
+    threadCountSelect.disabled = !implementationSelect.value.startsWith('wasm');
 }

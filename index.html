@@ -87,6 +87,7 @@
                     <label for="implementationSelect" class="text-sm mr-2 text-gray-400">Implementation:</label>
                     <select id="implementationSelect" class="bg-gray-700 border border-gray-600 text-white text-sm rounded-lg focus:ring-blue-500 focus:border-blue-500 p-2">
                         <option value="wasm">Wasm (OpenH264)</option>
+                        <option value="wasm_webgpu">Wasm (with WebGPU)</option>
                         <option value="webcodecs">Native (WebCodecs)</option>
                     </select>
                 </div>
@@ -120,6 +121,7 @@
                         <h3 class="text-lg font-semibold mb-2">1. Select Implementations</h3>
                         <div id="implCheckboxes" class="flex gap-4">
                             <label class="flex items-center"><input type="checkbox" value="wasm" checked class="form-checkbox h-5 w-5 bg-gray-700 border-gray-600 rounded text-indigo-600 focus:ring-indigo-500"> <span class="ml-2">Wasm (OpenH264)</span></label>
+                            <label class="flex items-center"><input type="checkbox" value="wasm_webgpu" checked class="form-checkbox h-5 w-5 bg-gray-700 border-gray-600 rounded text-indigo-600 focus:ring-indigo-500"> <span class="ml-2">Wasm (with WebGPU)</span></label>
                             <label class="flex items-center"><input type="checkbox" value="webcodecs" checked class="form-checkbox h-5 w-5 bg-gray-700 border-gray-600 rounded text-indigo-600 focus:ring-indigo-500"> <span class="ml-2">Native (WebCodecs)</span></label>
                         </div>
                     </div>
@@ -188,7 +190,7 @@
                         <p id="outputFps" class="text-2xl font-semibold">--</p>
                     </div>
                     <div>
-                        <p class="text-sm text-gray-400">Frame copy to WASM time (per frame, ms)</p>
+                        <p class="text-sm text-gray-400">Frame copy/convert time (per frame, ms)</p>
                         <p id="frameCopyToWasmTime" class="text-2xl font-semibold">-- ms</p>
                     </div>
                     <div>
@@ -232,7 +234,7 @@
                                 <th scope="col" class="px-6 py-3">Threads</th>
                                 <th scope="col" class="px-6 py-3">Input FPS</th>
                                 <th scope="col" class="px-6 py-3">Avg. Output FPS</th>
-                                <th scopy="col" class="px-6 py-3">Frame copy to WASM time (ms)</th>
+                                <th scope="col" class="px-6 py-3">Frame copy/convert (ms)</th>
                                 <th scope="col" class="px-6 py-3">Encode (per frame, ms)</th>
                                 <th scope="col" class="px-6 py-3">Avg. Decode (per frame, ms)</th>
                             </tr>
@@ -251,6 +253,7 @@
     </div>
 
     <script src="https://cdn.jsdelivr.net/npm/html2canvas@1.4.1/dist/html2canvas.min.js"></script>
+    <script src="scripts/wgsl_shaders.js"></script>
     <script src="scripts/h264.js"></script>
     <script src="scripts/app.js"></script>
     <script src="scripts/automation.js"></script>
