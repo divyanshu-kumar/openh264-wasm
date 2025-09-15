@@ -61,7 +61,6 @@ async function main() {
     let readbackBuffers = [];
     let frameIndex = 0;
     let lastFramePromise = null;
-    let lastGpuConvertTime = 0;
 
 
     // --- Stats calculation state ---
@@ -490,12 +489,10 @@ async function main() {
                 yuvData: yuvData.buffer,
                 width: videoWidth,
                 height: videoHeight,
-                convertTime: lastGpuConvertTime // Use the time measured from the previous frame
             }, [yuvData.buffer]);
         }
 
         // --- Pipelining Step 3: Start processing the CURRENT frame on the GPU ---
-        const t_start_gpu = performance.now();
         gpuDevice.queue.copyExternalImageToTexture(
             { source: inputVideo }, 
             { texture: rgbaTexture }, 
@@ -530,10 +527,6 @@ async function main() {
         commandEncoder.copyBufferToBuffer(packedYuvBuffer, 0, nextReadbackBuffer, 0, videoWidth * videoHeight * 1.5);
         gpuDevice.queue.submit([commandEncoder.finish()]);
         
-        // Store the time it took to run the GPU commands for the current frame.
-        // This will be sent to the worker along with the *next* frame's data.
-        lastGpuConvertTime = performance.now() - t_start_gpu;
-
         // --- Pipelining Step 5: Request the map for the CURRENT frame's data but DO NOT await it ---
         // Store the promise so the next frame can await it.
         lastFramePromise = nextReadbackBuffer.mapAsync(GPUMapMode.READ);

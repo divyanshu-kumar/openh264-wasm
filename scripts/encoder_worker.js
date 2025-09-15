@@ -100,7 +100,7 @@ self.onmessage = async (e) => {
             });
 
         } else if (type === 'encode_yuv') {
-            const { yuvData, convertTime } = e.data;
+            const { yuvData } = e.data;
             const yuvArray = new Uint8Array(yuvData);
 
             if (yuvArray.length > yuvBufferSize) {
@@ -110,14 +110,17 @@ self.onmessage = async (e) => {
                 yuvBufferPtr = Module._malloc(yuvArray.length);
                 yuvBufferSize = yuvArray.length;
             }
+            
+            const copyStartTime = performance.now();
             HEAPU8.set(yuvArray, yuvBufferPtr);
+            const copyEndTime = performance.now();
 
             const startTime = performance.now();
             encodeFrameYuv(yuvBufferPtr, width, height, encodedDataPtr_ptr, encodedSize_ptr);
             const encodeEndTime = performance.now();
             
             postEncodedData({
-                frameCopyToWasmTime: convertTime,
+                frameCopyToWasmTime: copyEndTime - copyStartTime,
                 encodeTime: encodeEndTime - startTime
             });
         }
