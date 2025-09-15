@@ -53,9 +53,10 @@ async function main() {
     // WebGPU State
     let gpuDevice = null;
     let rgbaToYuvPipeline = null;
+    let packYuvPipeline = null;
     let rgbaTexture = null;
-    let yBuffer, uBuffer, vBuffer, yuvReadbackBuffer;
-    let yBufferSize, uBufferSize, vBufferSize, yuvBufferSize;
+    let yBuffer, uBuffer, vBuffer, packedYuvBuffer, yuvReadbackBuffer, uniformBuffer;
+    let yBufferSize, uBufferSize, vBufferSize;
 
 
     // --- Stats calculation state ---
@@ -75,7 +76,9 @@ async function main() {
 
     // --- Machine Info ---
     async function getMachineInfo() {
-        if (machineInfo) return machineInfo;
+        if (machineInfo) {
+            return machineInfo;
+        }
         machineInfo = {
             cpuCores: navigator.hardwareConcurrency || 'N/A',
             memory: navigator.deviceMemory || 'N/A',
@@ -184,7 +187,9 @@ async function main() {
 
     // --- Main Control Logic ---
     async function stop() {
-        if (!cameraActive) return;
+        if (!cameraActive) {
+            return;
+        }
         console.log("Stopping current stream...");
         processing = false;
         cameraActive = false;
@@ -206,7 +211,7 @@ async function main() {
         if (videoEncoder && videoEncoder.state !== 'closed') {
             videoEncoder.close();
         }
-        decoders.forEach(d => { if (d.state !== 'closed') d.close(); });
+        decoders.forEach(d => { if (d.state !== 'closed') { d.close(); }});
         decoders = [];
         inputVideo.srcObject = null;
         outputContainer.innerHTML = '';
@@ -337,9 +342,9 @@ async function main() {
         
         // --- Create WebGPU resources for RGBA -> YUV conversion ---
         yBufferSize = videoWidth * videoHeight * 4; // Use 4 bytes for f32
-        uBufferSize = (videoWidth * videoHeight / 4) * 4; // Use 4 bytes for f32
+        uBufferSize = (videoWidth * videoHeight / 4) * 4;
         vBufferSize = uBufferSize;
-        yuvBufferSize = yBufferSize + uBufferSize + vBufferSize;
+        const packedYuvBufferSize = videoWidth * videoHeight * 1.5;
 
         rgbaTexture = gpuDevice.createTexture({
             size: [videoWidth, videoHeight],
@@ -347,15 +352,33 @@ async function main() {
             usage: GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.COPY_DST | GPUTextureUsage.RENDER_ATTACHMENT,
         });
 
-        yBuffer = gpuDevice.createBuffer({ size: yBufferSize, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC });
-        uBuffer = gpuDevice.createBuffer({ size: uBufferSize, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC });
-        vBuffer = gpuDevice.createBuffer({ size: vBufferSize, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC });
-        yuvReadbackBuffer = gpuDevice.createBuffer({ size: yuvBufferSize, usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ });
+        // Intermediate f32 buffers
+        yBuffer = gpuDevice.createBuffer({ size: yBufferSize, usage: GPUBufferUsage.STORAGE });
+        uBuffer = gpuDevice.createBuffer({ size: uBufferSize, usage: GPUBufferUsage.STORAGE });
+        vBuffer = gpuDevice.createBuffer({ size: vBufferSize, usage: GPUBufferUsage.STORAGE });
+        
+        // Final packed u8 buffer (as u32 for shader) and readback buffer
+        packedYuvBuffer = gpuDevice.createBuffer({ size: packedYuvBufferSize, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC });
+        yuvReadbackBuffer = gpuDevice.createBuffer({ size: packedYuvBufferSize, usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ });
+        
+        // Uniform buffer for dimensions
+        uniformBuffer = gpuDevice.createBuffer({
+            size: 8, // 2 x u32 (width, height)
+            usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
+        });
 
-        const shaderModule = gpuDevice.createShaderModule({ code: rgbaToYuvShaderCode });
+        // Pipeline 1: RGBA to YUV (f32)
+        const rgbaToYuvShader = gpuDevice.createShaderModule({ code: rgbaToYuvShaderCode });
         rgbaToYuvPipeline = await gpuDevice.createComputePipelineAsync({
             layout: 'auto',
-            compute: { module: shaderModule, entryPoint: 'main' }
+            compute: { module: rgbaToYuvShader, entryPoint: 'main' }
+        });
+        
+        // Pipeline 2: YUV (f32) to packed YUV (u8)
+        const packYuvShader = gpuDevice.createShaderModule({ code: packYuvShaderCode });
+        packYuvPipeline = await gpuDevice.createComputePipelineAsync({
+            layout: 'auto',
+            compute: { module: packYuvShader, entryPoint: 'main' }
         });
         
         await setupEncoderWorker(reconfigureWorkersAndCanvases);
@@ -448,72 +471,72 @@ async function main() {
         forceKeyFrameWasm();
     }
     
-    async function processVideoFrameWasmWebGPU(now, metadata) {
+    async function processVideoFrameWasmWebGPU() {
         const t0 = performance.now();
         
-        // 1. Draw video frame to a temporary 2D canvas.
         tempCtx.drawImage(inputVideo, 0, 0, videoWidth, videoHeight);
+        gpuDevice.queue.copyExternalImageToTexture({ source: tempCanvas }, { texture: rgbaTexture }, [videoWidth, videoHeight]);
+        
+        // Update uniform buffer with current frame dimensions
+        gpuDevice.queue.writeBuffer(uniformBuffer, 0, new Uint32Array([videoWidth, videoHeight]));
 
-        // 2. Copy the canvas content to our GPU texture.
-        gpuDevice.queue.copyExternalImageToTexture(
-            { source: tempCanvas },
-            { texture: rgbaTexture },
-            [videoWidth, videoHeight]
-        );
-
-        // 3. Create bind group and run the compute shader.
-        const bindGroup = gpuDevice.createBindGroup({
+        // --- Pass 1: RGBA to YUV (f32) ---
+        const rgbaToYuvBindGroup = gpuDevice.createBindGroup({
             layout: rgbaToYuvPipeline.getBindGroupLayout(0),
             entries: [
                 { binding: 0, resource: rgbaTexture.createView() },
                 { binding: 1, resource: { buffer: yBuffer } },
                 { binding: 2, resource: { buffer: uBuffer } },
                 { binding: 3, resource: { buffer: vBuffer } },
+                { binding: 4, resource: { buffer: uniformBuffer } },
+            ],
+        });
+        
+        // --- Pass 2: Pack YUV f32s into a single u8 buffer ---
+        const packYuvBindGroup = gpuDevice.createBindGroup({
+            layout: packYuvPipeline.getBindGroupLayout(0),
+            entries: [
+                { binding: 0, resource: { buffer: yBuffer } },
+                { binding: 1, resource: { buffer: uBuffer } },
+                { binding: 2, resource: { buffer: vBuffer } },
+                { binding: 3, resource: { buffer: packedYuvBuffer } },
+                { binding: 4, resource: { buffer: uniformBuffer } },
             ],
         });
         
         const commandEncoder = gpuDevice.createCommandEncoder();
-        const passEncoder = commandEncoder.beginComputePass();
-        passEncoder.setPipeline(rgbaToYuvPipeline);
-        passEncoder.setBindGroup(0, bindGroup);
-        passEncoder.dispatchWorkgroups(Math.ceil(videoWidth / 8), Math.ceil(videoHeight / 8));
-        passEncoder.end();
-
-        // 4. Copy the resulting Y, U, and V buffers into a single readback buffer.
-        commandEncoder.copyBufferToBuffer(yBuffer, 0, yuvReadbackBuffer, 0, yBufferSize);
-        commandEncoder.copyBufferToBuffer(uBuffer, 0, yuvReadbackBuffer, yBufferSize, uBufferSize);
-        commandEncoder.copyBufferToBuffer(vBuffer, 0, yuvReadbackBuffer, yBufferSize + uBufferSize, vBufferSize);
         
+        // Pass 1
+        const pass1Encoder = commandEncoder.beginComputePass();
+        pass1Encoder.setPipeline(rgbaToYuvPipeline);
+        pass1Encoder.setBindGroup(0, rgbaToYuvBindGroup);
+        pass1Encoder.dispatchWorkgroups(Math.ceil(videoWidth / 8), Math.ceil(videoHeight / 8));
+        pass1Encoder.end();
+
+        // Pass 2
+        const pass2Encoder = commandEncoder.beginComputePass();
+        pass2Encoder.setPipeline(packYuvPipeline);
+        pass2Encoder.setBindGroup(0, packYuvBindGroup);
+        const packedWorkgroups = Math.ceil((videoWidth * videoHeight * 1.5 / 4) / 64);
+        pass2Encoder.dispatchWorkgroups(packedWorkgroups);
+        pass2Encoder.end();
+        
+        commandEncoder.copyBufferToBuffer(packedYuvBuffer, 0, yuvReadbackBuffer, 0, videoWidth * videoHeight * 1.5);
         gpuDevice.queue.submit([commandEncoder.finish()]);
 
-        // 5. Map the readback buffer and get the YUV data.
         await yuvReadbackBuffer.mapAsync(GPUMapMode.READ);
-        const gpuReadbackArray = yuvReadbackBuffer.getMappedRange();
-        
-        const yLen = videoWidth * videoHeight;
-        const uLen = yLen / 4;
-        const vLen = uLen;
-        
-        const yFloat = new Float32Array(gpuReadbackArray, 0, yLen);
-        const uFloat = new Float32Array(gpuReadbackArray, yBufferSize, uLen);
-        const vFloat = new Float32Array(gpuReadbackArray, yBufferSize + uBufferSize, vLen);
-
-        const yuvData = new Uint8Array(yLen + uLen + vLen);
-        yuvData.set(yFloat);
-        yuvData.set(uFloat, yLen);
-        yuvData.set(vFloat, yLen + uLen);
-
+        const yuvGpuArray = yuvReadbackBuffer.getMappedRange();
+        const yuvData = new Uint8Array(yuvGpuArray.slice(0)); // Create a copy
         yuvReadbackBuffer.unmap();
         
         const t1 = performance.now();
         
-        // 6. Send the YUV data to the encoder worker.
         encoderWorker.postMessage({
             type: 'encode_yuv',
             yuvData: yuvData.buffer,
             width: videoWidth,
             height: videoHeight,
-            convertTime: t1-t0
+            convertTime: t1 - t0
         }, [yuvData.buffer]);
     }
 
@@ -534,25 +557,23 @@ async function main() {
                 }, [bitmap]);
             });
         } else if (selectedImpl === 'wasm_webgpu') {
-            await processVideoFrameWasmWebGPU(now, metadata);
+            await processVideoFrameWasmWebGPU();
         } else {
-            // Create a VideoFrame from the video element.
             const frame = new VideoFrame(inputVideo, { timestamp: metadata.mediaTime * 1000000 });
             handleWebCodecsFrame(frame);
             frame.close();
         }
-        // Keep the loop going by requesting the next frame.
         inputVideo.requestVideoFrameCallback(processVideoFrame);
     }
 
     // --- WebCodecs Implementation ---
     function getWebCodecString(width, height) {
         // Baseline Profile, Level 3.0 for SD resolutions
-        if (width * height <= 640 * 480) return 'avc1.42E01E';
+        if (width * height <= 640 * 480) { return 'avc1.42E01E'; }
         // Main Profile, Level 3.1 for 720p
-        if (width * height <= 1280 * 720) return 'avc1.4D401F';
+        if (width * height <= 1280 * 720) { return 'avc1.4D401F'; }
         // High Profile, Level 4.1 for 1080p
-        if (width * height <= 1920 * 1080) return 'avc1.640028';
+        if (width * height <= 1920 * 1080) { return 'avc1.640028'; }
         // Default to a high level for resolutions beyond 1080p
         return 'avc1.640033'; // Level 5.1
     }
@@ -595,7 +616,9 @@ async function main() {
                            decoder.configure(metadata.decoderConfig);
                         }
                     }
-                    decoder.decode(chunk);
+                    if (decoder.state === 'configured') {
+                        decoder.decode(chunk);
+                    }
                 });
                 const t1 = performance.now();
                 totalDecodeTime += (t1 - t0);
@@ -615,7 +638,9 @@ async function main() {
     function handleWebCodecsFrame(frame) {
         totalFrameCopyToWasmTime = 0; // N/A for WebCodecs
         const t2 = performance.now();
-        videoEncoder.encode(frame);
+        if (videoEncoder.state === 'configured') {
+            videoEncoder.encode(frame);
+        }
         totalEncodeTime += performance.now() - t2;
     }
     
@@ -663,7 +688,9 @@ async function main() {
     });
 
     captureButton.addEventListener('click', async () => {
-        if (!processing) return;
+        if (!processing) {
+            return;
+        }
 
         // Fetch and display machine info ONCE on the first capture
         if (!machineInfo) {
@@ -694,7 +721,9 @@ async function main() {
     
     downloadResultsButton.addEventListener('click', () => {
         // Now capture the whole results container including the machine info
-        if (!resultsContainer) return;
+        if (!resultsContainer) {
+            return;
+        }
 
         html2canvas(resultsContainer, {
             backgroundColor: '#1f2937', // A neutral dark background
@@ -714,11 +743,13 @@ async function main() {
 
     implementationSelect.addEventListener('change', () => {
         threadCountSelect.disabled = !implementationSelect.value.startsWith('wasm');
-        if (cameraActive) start();
+        if (cameraActive) {
+            start();
+        }
     });
-    resolutionSelect.addEventListener('change', () => { if (cameraActive) start(); });
-    streamCountSelect.addEventListener('change', () => { if (cameraActive) start(); });
-    threadCountSelect.addEventListener('change', () => { if (cameraActive) start(); });
+    resolutionSelect.addEventListener('change', () => { if (cameraActive) { start(); }});
+    streamCountSelect.addEventListener('change', () => { if (cameraActive) { start(); }});
+    threadCountSelect.addEventListener('change', () => { if (cameraActive) { start(); }});
 
     function renderResultsTable() {
         const hasResults = capturedResults.length > 0;
