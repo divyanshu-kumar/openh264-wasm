@@ -52,11 +52,16 @@ async function main() {
     
     // WebGPU State
     let gpuDevice = null;
-    let rgbaToYuvPipeline = null;
-    let packYuvPipeline = null;
+    let rgbaToYuvPackPipeline = null;
     let rgbaTexture = null;
-    let yBuffer, uBuffer, vBuffer, packedYuvBuffer, yuvReadbackBuffer, uniformBuffer;
-    let yBufferSize, uBufferSize, vBufferSize;
+    let packedYuvBuffer, uniformBuffer;
+    
+    // State for pipelined readbacks.
+    const READBACK_BUFFER_COUNT = 3;
+    let readbackBuffers = [];
+    let frameIndex = 0;
+    let lastFramePromise = null;
+    let lastGpuConvertTime = 0;
 
 
     // --- Stats calculation state ---
@@ -341,9 +346,6 @@ async function main() {
         tempCtx = tempCanvas.getContext('2d');
         
         // --- Create WebGPU resources for RGBA -> YUV conversion ---
-        yBufferSize = videoWidth * videoHeight * 4; // Use 4 bytes for f32
-        uBufferSize = (videoWidth * videoHeight / 4) * 4;
-        vBufferSize = uBufferSize;
         const packedYuvBufferSize = videoWidth * videoHeight * 1.5;
 
         rgbaTexture = gpuDevice.createTexture({
@@ -352,14 +354,21 @@ async function main() {
             usage: GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.COPY_DST | GPUTextureUsage.RENDER_ATTACHMENT,
         });
 
-        // Intermediate f32 buffers
-        yBuffer = gpuDevice.createBuffer({ size: yBufferSize, usage: GPUBufferUsage.STORAGE });
-        uBuffer = gpuDevice.createBuffer({ size: uBufferSize, usage: GPUBufferUsage.STORAGE });
-        vBuffer = gpuDevice.createBuffer({ size: vBufferSize, usage: GPUBufferUsage.STORAGE });
+        // The packedYuvBuffer needs storage for the compute shader,
+        // and COPY_DST so we can clear it before each run.
+        packedYuvBuffer = gpuDevice.createBuffer({ size: packedYuvBufferSize, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC | GPUBufferUsage.COPY_DST });
         
-        // Final packed u8 buffer (as u32 for shader) and readback buffer
-        packedYuvBuffer = gpuDevice.createBuffer({ size: packedYuvBufferSize, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC });
-        yuvReadbackBuffer = gpuDevice.createBuffer({ size: packedYuvBufferSize, usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ });
+        // Create a pool of readback buffers for pipelining.
+        readbackBuffers = [];
+        for (let i = 0; i < READBACK_BUFFER_COUNT; i++) {
+            readbackBuffers.push(gpuDevice.createBuffer({
+                size: packedYuvBufferSize,
+                usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ,
+            }));
+        }
+        // Initialize state for the pipeline.
+        frameIndex = 0;
+        lastFramePromise = Promise.resolve();
         
         // Uniform buffer for dimensions
         uniformBuffer = gpuDevice.createBuffer({
@@ -367,18 +376,11 @@ async function main() {
             usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
         });
 
-        // Pipeline 1: RGBA to YUV (f32)
-        const rgbaToYuvShader = gpuDevice.createShaderModule({ code: rgbaToYuvShaderCode });
-        rgbaToYuvPipeline = await gpuDevice.createComputePipelineAsync({
+        // Create a single pipeline with the optimized shader.
+        const rgbaToYuvPackShader = gpuDevice.createShaderModule({ code: optimizedRgbaToYuvPackShaderCode });
+        rgbaToYuvPackPipeline = await gpuDevice.createComputePipelineAsync({
             layout: 'auto',
-            compute: { module: rgbaToYuvShader, entryPoint: 'main' }
-        });
-        
-        // Pipeline 2: YUV (f32) to packed YUV (u8)
-        const packYuvShader = gpuDevice.createShaderModule({ code: packYuvShaderCode });
-        packYuvPipeline = await gpuDevice.createComputePipelineAsync({
-            layout: 'auto',
-            compute: { module: packYuvShader, entryPoint: 'main' }
+            compute: { module: rgbaToYuvPackShader, entryPoint: 'main' }
         });
         
         await setupEncoderWorker(reconfigureWorkersAndCanvases);
@@ -472,72 +474,71 @@ async function main() {
     }
     
     async function processVideoFrameWasmWebGPU() {
-        const t0 = performance.now();
+        // --- Pipelining Step 1: Wait for the PREVIOUS frame's data to be ready ---
+        await lastFramePromise;
+        const currentReadbackBuffer = readbackBuffers[frameIndex % READBACK_BUFFER_COUNT];
+
+        // --- Pipelining Step 2: Process the PREVIOUS frame's data ---
+        // This buffer was mapped at the end of the last frame call. Now it's ready.
+        if (currentReadbackBuffer.mapState === 'mapped') {
+            const yuvGpuArray = currentReadbackBuffer.getMappedRange();
+            const yuvData = new Uint8Array(yuvGpuArray.slice(0)); // Create a copy for the worker
+            currentReadbackBuffer.unmap();
+            
+            encoderWorker.postMessage({
+                type: 'encode_yuv',
+                yuvData: yuvData.buffer,
+                width: videoWidth,
+                height: videoHeight,
+                convertTime: lastGpuConvertTime // Use the time measured from the previous frame
+            }, [yuvData.buffer]);
+        }
+
+        // --- Pipelining Step 3: Start processing the CURRENT frame on the GPU ---
+        const t_start_gpu = performance.now();
+        gpuDevice.queue.copyExternalImageToTexture(
+            { source: inputVideo }, 
+            { texture: rgbaTexture }, 
+            [videoWidth, videoHeight]
+        );
         
-        tempCtx.drawImage(inputVideo, 0, 0, videoWidth, videoHeight);
-        gpuDevice.queue.copyExternalImageToTexture({ source: tempCanvas }, { texture: rgbaTexture }, [videoWidth, videoHeight]);
-        
-        // Update uniform buffer with current frame dimensions
         gpuDevice.queue.writeBuffer(uniformBuffer, 0, new Uint32Array([videoWidth, videoHeight]));
 
-        // --- Pass 1: RGBA to YUV (f32) ---
-        const rgbaToYuvBindGroup = gpuDevice.createBindGroup({
-            layout: rgbaToYuvPipeline.getBindGroupLayout(0),
+        // Create bind group for the single compute pass
+        const rgbaToYuvPackBindGroup = gpuDevice.createBindGroup({
+            layout: rgbaToYuvPackPipeline.getBindGroupLayout(0),
             entries: [
                 { binding: 0, resource: rgbaTexture.createView() },
-                { binding: 1, resource: { buffer: yBuffer } },
-                { binding: 2, resource: { buffer: uBuffer } },
-                { binding: 3, resource: { buffer: vBuffer } },
-                { binding: 4, resource: { buffer: uniformBuffer } },
+                { binding: 1, resource: { buffer: packedYuvBuffer } },
+                { binding: 2, resource: { buffer: uniformBuffer } },
             ],
         });
-        
-        // --- Pass 2: Pack YUV f32s into a single u8 buffer ---
-        const packYuvBindGroup = gpuDevice.createBindGroup({
-            layout: packYuvPipeline.getBindGroupLayout(0),
-            entries: [
-                { binding: 0, resource: { buffer: yBuffer } },
-                { binding: 1, resource: { buffer: uBuffer } },
-                { binding: 2, resource: { buffer: vBuffer } },
-                { binding: 3, resource: { buffer: packedYuvBuffer } },
-                { binding: 4, resource: { buffer: uniformBuffer } },
-            ],
-        });
-        
+
         const commandEncoder = gpuDevice.createCommandEncoder();
         
-        // Pass 1
-        const pass1Encoder = commandEncoder.beginComputePass();
-        pass1Encoder.setPipeline(rgbaToYuvPipeline);
-        pass1Encoder.setBindGroup(0, rgbaToYuvBindGroup);
-        pass1Encoder.dispatchWorkgroups(Math.ceil(videoWidth / 8), Math.ceil(videoHeight / 8));
-        pass1Encoder.end();
-
-        // Pass 2
-        const pass2Encoder = commandEncoder.beginComputePass();
-        pass2Encoder.setPipeline(packYuvPipeline);
-        pass2Encoder.setBindGroup(0, packYuvBindGroup);
-        const packedWorkgroups = Math.ceil((videoWidth * videoHeight * 1.5 / 4) / 64);
-        pass2Encoder.dispatchWorkgroups(packedWorkgroups);
-        pass2Encoder.end();
+        // The shader uses atomicOr, so we must clear the buffer to 0 before each pass.
+        commandEncoder.clearBuffer(packedYuvBuffer);
         
-        commandEncoder.copyBufferToBuffer(packedYuvBuffer, 0, yuvReadbackBuffer, 0, videoWidth * videoHeight * 1.5);
+        const passEncoder = commandEncoder.beginComputePass();
+        passEncoder.setPipeline(rgbaToYuvPackPipeline);
+        passEncoder.setBindGroup(0, rgbaToYuvPackBindGroup);
+        passEncoder.dispatchWorkgroups(Math.ceil(videoWidth / 8), Math.ceil(videoHeight / 8));
+        passEncoder.end();
+        
+        // --- Pipelining Step 4: Copy the result to the NEXT readback buffer ---
+        const nextReadbackBuffer = readbackBuffers[(frameIndex + 1) % READBACK_BUFFER_COUNT];
+        commandEncoder.copyBufferToBuffer(packedYuvBuffer, 0, nextReadbackBuffer, 0, videoWidth * videoHeight * 1.5);
         gpuDevice.queue.submit([commandEncoder.finish()]);
+        
+        // Store the time it took to run the GPU commands for the current frame.
+        // This will be sent to the worker along with the *next* frame's data.
+        lastGpuConvertTime = performance.now() - t_start_gpu;
 
-        await yuvReadbackBuffer.mapAsync(GPUMapMode.READ);
-        const yuvGpuArray = yuvReadbackBuffer.getMappedRange();
-        const yuvData = new Uint8Array(yuvGpuArray.slice(0)); // Create a copy
-        yuvReadbackBuffer.unmap();
+        // --- Pipelining Step 5: Request the map for the CURRENT frame's data but DO NOT await it ---
+        // Store the promise so the next frame can await it.
+        lastFramePromise = nextReadbackBuffer.mapAsync(GPUMapMode.READ);
         
-        const t1 = performance.now();
-        
-        encoderWorker.postMessage({
-            type: 'encode_yuv',
-            yuvData: yuvData.buffer,
-            width: videoWidth,
-            height: videoHeight,
-            convertTime: t1 - t0
-        }, [yuvData.buffer]);
+        frameIndex++;
     }
 
     async function processVideoFrame(now, metadata) {

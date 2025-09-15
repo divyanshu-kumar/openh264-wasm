@@ -96,6 +96,74 @@ const packYuvShaderCode = `
     }
 `;
 
+// A single-pass shader that converts RGBA to YUV and packs it directly
+// into the final buffer format. 
+const optimizedRgbaToYuvPackShaderCode = `
+    struct Uniforms {
+        width: u32,
+        height: u32,
+    };
+
+    @group(0) @binding(0) var tex: texture_2d<f32>;
+    @group(0) @binding(1) var<storage, read_write> yuv_out: array<atomic<u32>>;
+    @group(0) @binding(2) var<uniform> uniforms: Uniforms;
+
+    // These are the same coefficients as openh264_wrapper.cpp, used for integer math.
+    // Y = ((66*R + 129*G + 25*B + 128) >> 8) + 16
+    // U = ((-38*R - 74*G + 112*B + 128) >> 8) + 128
+    // V = ((112*R - 94*G - 18*B + 128) >> 8) + 128
+
+    @compute @workgroup_size(8, 8, 1)
+    fn main(@builtin(global_invocation_id) id: vec3<u32>) {
+        if (id.x >= uniforms.width || id.y >= uniforms.height) {
+            return;
+        }
+
+        // Load RGBA and convert to u32 0-255 range
+        let rgba = textureLoad(tex, vec2<i32>(id.xy), 0).rgba * 255.0;
+        let r = u32(rgba.r);
+        let g = u32(rgba.g);
+        let b = u32(rgba.b);
+
+        // --- Y Plane Calculation ---
+        let y_val = ((66u * r + 129u * g + 25u * b + 128u) >> 8u) + 16u;
+        
+        let y_idx = id.y * uniforms.width + id.x;
+        let y_word_idx = y_idx / 4u;
+        let y_byte_shift = (y_idx % 4u) * 8u;
+        
+        // Atomically OR the Y value into the correct byte of the output u32.
+        atomicOr(&yuv_out[y_word_idx], y_val << y_byte_shift);
+
+        // --- U and V Plane Calculation (for each 2x2 block) ---
+        // We only need to calculate U and V for the top-left pixel of each 2x2 block.
+        if ((id.x % 2u == 0u) && (id.y % 2u == 0u)) {
+            // We use the top-left pixel's color for the whole 2x2 block's chroma, matching the C++ behavior.
+            // Cast to i32 for intermediate calculations which can be negative.
+            let u_val = ((-38 * i32(r) - 74 * i32(g) + 112 * i32(b) + 128) >> 8) + 128;
+            let v_val = ((112 * i32(r) - 94 * i32(g) - 18 * i32(b) + 128) >> 8) + 128;
+            
+            let y_size = uniforms.width * uniforms.height;
+            let uv_width = uniforms.width / 2u;
+
+            // U plane position
+            let u_idx = (id.y / 2u) * uv_width + (id.x / 2u);
+            let u_byte_pos = y_size + u_idx;
+            let u_word_idx = u_byte_pos / 4u;
+            let u_byte_shift = (u_byte_pos % 4u) * 8u;
+            atomicOr(&yuv_out[u_word_idx], u32(u_val) << u_byte_shift);
+
+            // V plane position
+            let v_idx = u_idx; // V has same index as U in its own plane
+            let u_size = (uniforms.width * uniforms.height) / 4u;
+            let v_byte_pos = y_size + u_size + v_idx;
+            let v_word_idx = v_byte_pos / 4u;
+            let v_byte_shift = (v_byte_pos % 4u) * 8u;
+            atomicOr(&yuv_out[v_word_idx], u32(v_val) << v_byte_shift);
+        }
+    }
+`;
+
 
 const yuvToRgbaShaderModule = `
     struct VertexOutput {
