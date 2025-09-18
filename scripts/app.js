@@ -49,7 +49,7 @@ async function main() {
 
     let encodedFrameSAB = null;
     let controlSAB = null;
-    const FRAME_BUFFER_POOL_SIZE = 15; // Number of buffers in the pool
+    const FRAME_BUFFER_POOL_SIZE = 40; // Number of buffers in the pool
     const MAX_FRAME_SIZE = 2 * 1024 * 1024; // 2MB, should be enough for a single frame
 
     // WebCodecs State
