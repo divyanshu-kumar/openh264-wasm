@@ -13,6 +13,12 @@ let encodedSize_ptr = 0;
 let isEncoding = false;
 let isCleanedUp = false;
 
+let encodedFrameSAB, controlSAB, controlView;
+let frameDataViews = [];
+let FRAME_BUFFER_POOL_SIZE, MAX_FRAME_SIZE;
+let currentBufferIndex = 0;
+let numStreams = 1; // Default number of consuming streams
+
 // The Wasm module needs to be loaded in the worker
 importScripts('h264.js');
 
@@ -26,7 +32,30 @@ Module.onRuntimeInitialized = () => {
 };
 
 self.onmessage = async (e) => {
-    if (!wasmReady) return;
+    if (e.data.type === 'init_sab') {
+        encodedFrameSAB = e.data.encodedFrameSAB;
+        controlSAB = e.data.controlSAB;
+        FRAME_BUFFER_POOL_SIZE = e.data.FRAME_BUFFER_POOL_SIZE;
+        MAX_FRAME_SIZE = e.data.MAX_FRAME_SIZE;
+        numStreams = e.data.numStreams;
+        controlView = new Int32Array(controlSAB);
+        for (let i = 0; i < FRAME_BUFFER_POOL_SIZE; i++) {
+            frameDataViews[i] = new Uint8Array(encodedFrameSAB, i * MAX_FRAME_SIZE, MAX_FRAME_SIZE);
+        }
+        console.log('Encoder Worker: Shared buffers initialized.');
+        currentBufferIndex = 0;
+        return;
+    }
+
+    if (e.data.type === 'update_streams') {
+        numStreams = e.data.numStreams;
+        console.log(`Encoder Worker: Updated numStreams to ${numStreams}`);
+        return;
+    }
+
+    if (!wasmReady || !controlSAB) {
+        return;
+    }
 
     if (e.data.type === 'cleanup') {
         isCleanedUp = true; 
@@ -94,7 +123,7 @@ self.onmessage = async (e) => {
             encodeFrame(rgbaBufferPtr, width, height, encodedDataPtr_ptr, encodedSize_ptr);
             const encodeEndTime = performance.now();
 
-            postEncodedData({
+            writeToSharedBufferAndPost({
                 frameCopyToWasmTime: copyEndTime - startTime,
                 encodeTime: encodeEndTime - copyEndTime
             });
@@ -119,7 +148,7 @@ self.onmessage = async (e) => {
             encodeFrameYuv(yuvBufferPtr, width, height, encodedDataPtr_ptr, encodedSize_ptr);
             const encodeEndTime = performance.now();
             
-            postEncodedData({
+            writeToSharedBufferAndPost({
                 frameCopyToWasmTime: copyEndTime - copyStartTime,
                 encodeTime: encodeEndTime - startTime
             });
@@ -131,16 +160,43 @@ self.onmessage = async (e) => {
     }
 };
 
-function postEncodedData(timingInfo) {
+function writeToSharedBufferAndPost(timingInfo) {
     const encodedDataPtr = Module.getValue(encodedDataPtr_ptr, 'i32');
     const encodedSize = Module.getValue(encodedSize_ptr, 'i32');
 
-    if (encodedSize > 0) {
-        const encodedData = HEAPU8.slice(encodedDataPtr, encodedDataPtr + encodedSize);
-        self.postMessage({
-            type: 'encoded',
-            encodedData: encodedData.buffer,
-            ...timingInfo
-        }, [encodedData.buffer]);
+    if (encodedSize <= 0) {
+        return;
     }
+    if (encodedSize > MAX_FRAME_SIZE) {
+        console.error(`Encoder: Encoded frame size (${encodedSize}) exceeds max buffer size (${MAX_FRAME_SIZE}). Dropping frame.`);
+        return;
+    }
+
+    // Find a free buffer
+    // A simple round-robin approach.
+    const refCountIndex = (currentBufferIndex * 2) + 1;
+    if (Atomics.load(controlView, refCountIndex) > 0) {
+        // Buffer is still in use by decoders, we have to drop the frame.
+        // This indicates the decoders can't keep up.
+        console.warn(`Encoder: Buffer ${currentBufferIndex} is still in use (ref count > 0). Dropping frame.`);
+        return;
+    }
+
+    // --- Copy data from Wasm heap to the shared buffer ---
+    const wasmEncodedData = HEAPU8.subarray(encodedDataPtr, encodedDataPtr + encodedSize);
+    frameDataViews[currentBufferIndex].set(wasmEncodedData);
+
+    const sizeIndex = currentBufferIndex * 2;
+    controlView[sizeIndex] = encodedSize;
+    controlView[refCountIndex] = numStreams;
+    
+    // --- Post message with index ---
+    self.postMessage({
+        type: 'encoded',
+        bufferIndex: currentBufferIndex,
+        encodedSize: encodedSize,
+        ...timingInfo
+    });
+
+    currentBufferIndex = (currentBufferIndex + 1) % FRAME_BUFFER_POOL_SIZE;
 }

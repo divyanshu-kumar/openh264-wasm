@@ -19,6 +19,11 @@ let decoderStreamsIdx = [];
 let messageQueue = [];
 let isDecoding = false;
 
+// SharedArrayBuffer state
+let encodedFrameSAB, controlSAB, controlView;
+let frameDataViews = [];
+let FRAME_BUFFER_POOL_SIZE, MAX_FRAME_SIZE;
+
 const streamContexts = new Map(); // For standard rendering
 const streamGpuContexts = new Map(); // For WebGPU rendering
 
@@ -130,17 +135,24 @@ async function handleSetCanvasWebGPU({ canvas, streamIndex }) {
 
 
 async function handleDecode(data) {
+    const { bufferIndex } = data;
+    const refCountIndex = bufferIndex * 2 + 1;
+
     if (isDecoding) {
-        // Drop frame if busy, but don't request a keyframe as that can cause a storm.
-        // The natural keyframe interval should handle recovery.
+        // If busy, we must still decrement the counter for this frame,
+        // otherwise the buffer will be locked and never reused.
+        Atomics.sub(controlView, refCountIndex, 1);
         return;
     }
     isDecoding = true;
 
+    let bufferReleased = false;
+
     try {
-        const { streamIndex, encodedData, width, height } = data;
+        // Get data from SharedArrayBuffer using index instead of from message payload
+        const { streamIndex, encodedSize, width, height } = data;
+        const encodedDataArray = frameDataViews[bufferIndex].subarray(0, encodedSize);
         
-        const encodedDataArray = new Uint8Array(encodedData);
         if (encodedDataArray.length > encodedBufferSize) {
             if (encodedBufferPtr) {
                 Module._free(encodedBufferPtr);
@@ -149,6 +161,8 @@ async function handleDecode(data) {
             encodedBufferSize = encodedDataArray.length;
         }
         HEAPU8.set(encodedDataArray, encodedBufferPtr);
+        Atomics.sub(controlView, refCountIndex, 1);
+        bufferReleased = true;
         
         const t0 = performance.now();
         
@@ -206,6 +220,9 @@ async function handleDecode(data) {
         });
     } finally {
         isDecoding = false;
+        if (!bufferReleased) {
+            Atomics.sub(controlView, refCountIndex, 1);
+        }
     }
 }
 
@@ -301,7 +318,20 @@ self.onmessage = (e) => {
         workerId = e.data.id;
         return;
     }
-    if (!wasmReady) {
+    if (e.data.type === 'init_sab') {
+        encodedFrameSAB = e.data.encodedFrameSAB;
+        controlSAB = e.data.controlSAB;
+        FRAME_BUFFER_POOL_SIZE = e.data.FRAME_BUFFER_POOL_SIZE;
+        MAX_FRAME_SIZE = e.data.MAX_FRAME_SIZE;
+        controlView = new Int32Array(controlSAB);
+        for (let i = 0; i < FRAME_BUFFER_POOL_SIZE; i++) {
+            frameDataViews[i] = new Uint8Array(encodedFrameSAB, i * MAX_FRAME_SIZE, MAX_FRAME_SIZE);
+        }
+        console.log(`Worker ${workerId}: Shared buffers initialized.`);
+        return;
+    }
+
+    if (!wasmReady || !controlSAB) {
         messageQueue.push(e.data);
         return;
     }

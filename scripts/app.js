@@ -47,6 +47,11 @@ async function main() {
     let encoderWorker = null;
     let machineInfo = null;
 
+    let encodedFrameSAB = null;
+    let controlSAB = null;
+    const FRAME_BUFFER_POOL_SIZE = 15; // Number of buffers in the pool
+    const MAX_FRAME_SIZE = 2 * 1024 * 1024; // 2MB, should be enough for a single frame
+
     // WebCodecs State
     let videoEncoder, decoders = [];
     
@@ -283,6 +288,26 @@ async function main() {
             await stop();
         }
     }
+
+    function setupSharedBuffers() {
+        // Shared buffer for the actual encoded frame data
+        if (encodedFrameSAB == null) {
+            encodedFrameSAB = new SharedArrayBuffer(FRAME_BUFFER_POOL_SIZE * MAX_FRAME_SIZE);
+        }
+
+        // Shared buffer for control data: [size, ref_count, size, ref_count, ...]
+        // Using Int32Array, so 2 integers (8 bytes) per frame buffer.
+        if (controlSAB == null) {
+            controlSAB = new SharedArrayBuffer(FRAME_BUFFER_POOL_SIZE * 2 * Int32Array.BYTES_PER_ELEMENT);
+        }
+
+        // Initialize all reference counts to 0
+        const controlView = new Int32Array(controlSAB);
+        for (let i = 0; i < FRAME_BUFFER_POOL_SIZE; i++) {
+            controlView[i * 2] = 0; // size
+            controlView[(i * 2) + 1] = 0; // ref_count
+        }
+    }
     
     async function setupEncoderWorker(onInitDone) {
         if (encoderWorker) {
@@ -292,8 +317,19 @@ async function main() {
         return new Promise((resolve, reject) => {
             encoderWorker = new Worker('scripts/encoder_worker.js');
             encoderWorker.onerror = (err) => reject(err);
+
+            // Send the shared buffers to the encoder worker
+            encoderWorker.postMessage({
+                type: 'init_sab',
+                encodedFrameSAB,
+                controlSAB,
+                FRAME_BUFFER_POOL_SIZE,
+                MAX_FRAME_SIZE,
+                numStreams: parseInt(streamCountSelect.value, 10),
+            });
+
             encoderWorker.onmessage = async (e) => {
-                const { type, encodedData, frameCopyToWasmTime, encodeTime } = e.data;
+                const { type } = e.data;
                 if (type === 'ready') {
                     // Once the worker's Wasm module is ready, initialize the encoder
                     encoderWorker.postMessage({ type: 'init', width: videoWidth, height: videoHeight });
@@ -301,19 +337,22 @@ async function main() {
                     await onInitDone();
                     resolve();
                 } else if (type === 'encoded') {
+                    const { frameCopyToWasmTime, encodeTime } = e.data;
                     if (frameCopyToWasmTime) {
                         totalFrameCopyToWasmTime += frameCopyToWasmTime;
                     }
                     if (encodeTime) {
                         totalEncodeTime += encodeTime;
                     }
-                    // When an encoded frame comes back, distribute it to the decoders
+                    // When an encoded frame index comes back, distribute it to the decoders
+                    const { bufferIndex, encodedSize } = e.data;
                     const numStreams = parseInt(streamCountSelect.value, 10);
                     for (let i = 0; i < numStreams; i++) {
                         decoderWorkers[i % decoderWorkers.length].postMessage({
                             type: 'decode',
                             streamIndex: i,
-                            encodedData: encodedData,
+                            bufferIndex: bufferIndex,
+                            encodedSize: encodedSize,
                             width: videoWidth,
                             height: videoHeight
                         });
@@ -330,6 +369,7 @@ async function main() {
         tempCanvas.height = videoHeight;
         tempCtx = tempCanvas.getContext('2d', { willReadFrequently: true });
         
+        setupSharedBuffers();
         await setupEncoderWorker(reconfigureWorkersAndCanvases);
     }
     
@@ -382,6 +422,7 @@ async function main() {
             compute: { module: rgbaToYuvPackShader, entryPoint: 'main' }
         });
         
+        setupSharedBuffers();
         await setupEncoderWorker(reconfigureWorkersAndCanvases);
     }
 
@@ -410,6 +451,9 @@ async function main() {
                 return resolve();
             }
             const numStreams = parseInt(streamCountSelect.value, 10);
+            if (encoderWorker) {
+                encoderWorker.postMessage({ type: 'update_streams', numStreams: numStreams });
+            }
             if (selectedThreads === 'default' && numThreads > numStreams ) {
                 numThreads = Math.max(1, numStreams);
                 console.log(`"Default" threads selected. NumStreams lesser than available threads, now using ${numThreads}.`);
@@ -421,6 +465,15 @@ async function main() {
                 const worker = new Worker('scripts/decoder_worker.js');
                 worker.postMessage({ type: 'set_id', id: i });
                 worker.onerror = (err) => reject(new Error(`Worker error: ${err.message}`));
+
+                // Send shared buffers to each decoder worker
+                worker.postMessage({
+                    type: 'init_sab',
+                    encodedFrameSAB,
+                    controlSAB,
+                    FRAME_BUFFER_POOL_SIZE,
+                    MAX_FRAME_SIZE,
+                });
 
                 worker.onmessage = (e) => {
                     if (e.data.type === 'ready') {
